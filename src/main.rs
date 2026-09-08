@@ -24,7 +24,7 @@ use bilore_ml_rs::risk::{risk_params, ModelQuality, Probabilities, RiskConfig};
 use bilore_ml_rs::trade_setup::{trade_setup, ProfileLevels, SetupResult, TradeSetupConfig};
 use bilore_ml_rs::{db as ml_db, features};
 use bilore_monitor::period_agg::{PeriodAggregator, PeriodBar};
-use bilore_monitor::{db, telegram};
+use bilore_monitor::{db, sound, telegram};
 use chrono::{Duration as ChronoDuration, NaiveDate, Utc};
 use chrono_tz::America::Chicago;
 use ndarray::Array1;
@@ -156,6 +156,7 @@ async fn main() -> Result<()> {
             if let Some(mut ot) = open_trade.take() {
                 if shadow_trader::close(&mut ot.trade) {
                     let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
+                    sound::play(sound::AlertKind::Expired);
                     notify(&http, &bot_token, &chat_id, &telegram::result_message(&symbol, &ot.trade)).await;
                 }
             }
@@ -199,6 +200,7 @@ async fn main() -> Result<()> {
                     && matches!(ot.trade.outcome, Outcome::Won | Outcome::Lost)
                 {
                     let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
+                    sound::play(if ot.trade.outcome == Outcome::Won { sound::AlertKind::Won } else { sound::AlertKind::Lost });
                     notify(&http, &bot_token, &chat_id, &telegram::result_message(&symbol, &ot.trade)).await;
                 }
             }
@@ -313,6 +315,7 @@ async fn try_signal(
     }
     *locked_today = true;
 
+    sound::play(sound::AlertKind::Setup);
     let msg = format!(
         "🟢 <b>[V2] SETUP — {symbol}</b>\nDirection : <b>{:?}</b>\nEntry     : <b>{:.2}</b>\nStop      : {:.2}\nTarget    : {:.2}\nConfidence: {:.0}% ({})",
         setup.direction, setup.entry_price, setup.stop, setup.targets[0].price, lean_risk.confidence * 100.0, lean_risk.tier_label

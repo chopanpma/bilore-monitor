@@ -10,6 +10,7 @@ via `git config core.hooksPath .githooks`). `db.rs` (DB I/O) and `main.rs`
 | `period_agg.rs` | done | [period_agg.md](period_agg.md) |
 | `live_signal.rs` | done, superseded (see below) | [live_signal.md](live_signal.md) |
 | `telegram.rs` | done | [telegram.md](telegram.md) |
+| `sound.rs` | done | [sound.md](sound.md) |
 | `db.rs` | exempt (I/O) | — |
 | `main.rs` | exempt (wiring) | — |
 
