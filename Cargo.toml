@@ -14,11 +14,14 @@ path = "src/main.rs"
 [dependencies]
 bilore-core = { path = "../bilore-core" }
 bilore-backtest = { path = "../bilore-backtest" }
+bilore-ml-rs = { path = "../bilore-ml-rs" }
+tpo-builder = { path = "../tpo-builder" }
 
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "chrono", "rust_decimal"] }
 reqwest = { version = "0.12", features = ["json"] }
 serde_json = "1"
+ndarray = "0.16"
 
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
