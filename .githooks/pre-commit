@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Blocks a commit that changes a logic file under src/ without also staging
+# its docs/<module>.md — keeps the module diagrams from silently going stale.
+# db.rs and main.rs are I/O/wiring, not decision logic, and are exempt.
+set -euo pipefail
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+
+missing=0
+for f in $staged; do
+    case "$f" in
+        src/*.rs)
+            module=$(basename "$f" .rs)
+            case "$module" in
+                lib|db|main) continue ;;
+            esac
+            doc="docs/${module}.md"
+            if ! grep -qxF "$doc" <<< "$staged"; then
+                echo "error: $f changed but $doc was not staged." >&2
+                echo "       Update the module diagram, then: git add $doc" >&2
+                missing=1
+            fi
+            ;;
+    esac
+done
+
+exit $missing
