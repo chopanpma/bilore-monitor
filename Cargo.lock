@@ -173,7 +173,10 @@ dependencies = [
  "chrono",
  "dotenvy",
  "ndarray",
+ "rand 0.8.8",
  "rust_decimal",
+ "serde",
+ "serde_json",
  "sqlx",
  "tokio",
  "tracing",
@@ -185,6 +188,7 @@ name = "bilore-monitor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-nats",
  "bilore-backtest",
  "bilore-core",
  "bilore-ml-rs",
@@ -194,6 +198,7 @@ dependencies = [
  "ndarray",
  "reqwest",
  "rust_decimal",
+ "serde",
  "serde_json",
  "sqlx",
  "tokio",
