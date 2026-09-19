@@ -64,25 +64,35 @@ pub async fn poll_new_ticks(pool: &PgPool, symbol: &str, since: DateTime<Utc>) -
 }
 
 /// Insert a fresh `shadow_trades_v2` row for a newly-locked signal.
-/// Self-contained (no `DailyPlanRow`) — `anchor_lbl`/`confidence` are left
-/// NULL, since this monitor's setups don't come from a scored ML plan.
+/// Self-contained (no `DailyPlanRow`) — `anchor_lbl` is left NULL since
+/// this monitor's setups don't come from a scored ML plan; `confidence`
+/// carries the strategy's entry trust (0..1, signal-time — semantics per
+/// strategy in `bilore-project-conf/contracts/strategies.md`, "Trust
+/// metric": ml-model = leaned-side `risk_params.confidence`, fade-poc =
+/// `fade::fade_trust`).
+/// `strategy` is the `bilore_core::strategy` slug identifying which of the
+/// monitor's strategies locked this trade (see
+/// `bilore-project-conf/contracts/strategies.md`).
 pub async fn insert_shadow_trade_v2(
     pool: &PgPool,
     session_date: NaiveDate,
     symbol: &str,
+    strategy: &str,
+    trust: Option<f64>,
     trade: &ShadowTrade,
 ) -> Result<i64> {
     let row: (i32,) = sqlx::query_as(
         r#"
         INSERT INTO shadow_trades_v2
-            (session_date, symbol, direction, entry_lo, entry_hi, stop, target_1,
-             stop_ticks, mes_contracts, outcome, signal_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+            (session_date, symbol, strategy, direction, entry_lo, entry_hi, stop, target_1,
+             stop_ticks, mes_contracts, confidence, outcome, signal_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
         RETURNING id
         "#,
     )
     .bind(session_date)
     .bind(symbol)
+    .bind(strategy)
     .bind(format!("{:?}", trade.direction))
     .bind(trade.entry_lo)
     .bind(trade.entry_hi)
@@ -90,6 +100,7 @@ pub async fn insert_shadow_trade_v2(
     .bind(trade.target_1)
     .bind((trade.entry_lo - trade.stop).abs() / Decimal::new(25, 2)) // stop_ticks, 0.25 tick size
     .bind(trade.mes_contracts)
+    .bind(trust)
     .bind(trade.outcome.as_str())
     .fetch_one(pool)
     .await?;

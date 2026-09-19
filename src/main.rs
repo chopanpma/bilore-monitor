@@ -2,13 +2,21 @@
 //! -> trade_setup, faithfully ported to `bilore-ml-rs`) live, driven by a
 //! Rust-trained model instead of v1's sklearn one, independent of
 //! `daily_plans` (which `bilore_session.py` silently stopped writing to
-//! since 2026-06-18). Tracks one shadow trade per session in
-//! `shadow_trades_v2`, sends `[V2]`-prefixed Telegram alerts on the same
-//! bot/chat as v1, for a genuine LIVE comparison against v1's real
-//! historical track record (61.3% win rate, `shadow_trades`) — after two
-//! backtests of this same logic came back suspiciously strong (74-76% win
-//! rate) and couldn't be fully verified clean, the decision was to trust
-//! forward-only live results instead of chasing the backtest further.
+//! since 2026-06-18). Tracks shadow trades in `shadow_trades_v2`, sends
+//! `[V2]`-prefixed Telegram alerts on the same bot/chat as v1, for a
+//! genuine LIVE comparison against v1's real historical track record (61.3%
+//! win rate, `shadow_trades`) — after two backtests of this same logic came
+//! back suspiciously strong (74-76% win rate) and couldn't be fully
+//! verified clean, the decision was to trust forward-only live results
+//! instead of chasing the backtest further.
+//!
+//! **Two strategies per symbol, independent (2026-09-18):** the original ML
+//! pipeline (`ml-model`) plus the fade-toward-POC rule (`fade-poc`,
+//! model-analysis.md §6.10's live lead — see `fade.rs`). Each has its own
+//! open-trade slot and one-trade-per-session lock, so neither suppresses
+//! the other's signals; every `shadow_trades_v2` row and Telegram alert
+//! carries its strategy label (`bilore_core::strategy`,
+//! contracts/strategies.md).
 //!
 //! Superseded 2026-09-08's structure-only version (`live_signal.rs`,
 //! `bilore-backtest::signal`) — that logic is left in place (still used by
@@ -33,12 +41,14 @@
 use anyhow::Result;
 use bilore_core::market_structure::Direction;
 use bilore_core::shadow_trader::{self, Outcome, ShadowTrade};
+use bilore_core::strategy;
 use bilore_ml_rs::model::{Config as ModelConfig, LogisticModel};
 use bilore_ml_rs::predict::{feature_vector, predict, LivePeriodInput};
 use bilore_ml_rs::risk::{risk_params, ModelQuality, Probabilities, RiskConfig};
 use bilore_ml_rs::trade_setup::{trade_setup, ProfileLevels, SetupResult, TradeSetupConfig};
 use bilore_ml_rs::{db as ml_db, features};
 use bilore_ml_rs::live_state::{LiveModelState, LiveSetup};
+use bilore_monitor::fade;
 use bilore_monitor::period_agg::{PeriodAggregator, PeriodBar};
 use bilore_monitor::{db, sound, telegram};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
@@ -55,6 +65,21 @@ use tpo_builder::profile::{rth_session_config, TpoProfile};
 struct OpenTrade {
     db_id: i64,
     trade: ShadowTrade,
+    /// Entry trust (0..1) captured at lock time — the same value persisted
+    /// to `shadow_trades_v2.confidence`, echoed back in the result
+    /// Telegram message (contracts/strategies.md, "Trust metric").
+    trust: f64,
+}
+
+/// One strategy's shadow-trade slot within a symbol's state: its currently
+/// tracked trade and its own one-trade-per-session lock. Two slots
+/// (`ml-model`, `fade-poc`) run fully independent of each other so neither
+/// strategy can suppress the other's signals — see
+/// `bilore-project-conf/contracts/strategies.md`.
+#[derive(Default)]
+struct StrategySlot {
+    open: Option<OpenTrade>,
+    locked_today: bool,
 }
 
 struct TrainedModel {
@@ -91,8 +116,11 @@ struct PerSymbolState {
     swing_bars: Vec<bilore_core::market_structure::Bar>,
     last_bar_ts: DateTime<Utc>,
     last_tick_ts: DateTime<Utc>,
-    open_trade: Option<OpenTrade>,
-    locked_today: bool,
+    /// `ml-model` slot — the ML pipeline's shadow trade (see `try_signal`).
+    ml: StrategySlot,
+    /// `fade-poc` slot — the fade-toward-POC rule's shadow trade
+    /// (see `try_fade_signal`, `bilore_monitor::fade`).
+    fade: StrategySlot,
 }
 
 /// Trains fresh from whatever `period_profiles`/`session_profiles`/
@@ -245,8 +273,8 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
         swing_bars: Vec::new(),
         last_bar_ts: start,
         last_tick_ts: start,
-        open_trade: None,
-        locked_today: false,
+        ml: StrategySlot::default(),
+        fade: StrategySlot::default(),
     })
 }
 
@@ -363,11 +391,18 @@ async fn main() -> Result<()> {
             let bf = bridge_from_for(symbol);
             let now_ct = Utc::now().with_timezone(&Chicago).date_naive();
             if now_ct != state.today_ct {
-                if let Some(mut ot) = state.open_trade.take() {
+                if let Some(mut ot) = state.ml.open.take() {
                     if shadow_trader::close(&mut ot.trade) {
                         let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
                         sound::play(sound::AlertKind::Expired);
-                        notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, &ot.trade)).await;
+                        notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, strategy::ML_MODEL, &ot.trade, ot.trust)).await;
+                    }
+                }
+                if let Some(mut ot) = state.fade.open.take() {
+                    if shadow_trader::close(&mut ot.trade) {
+                        let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
+                        sound::play(sound::AlertKind::Expired);
+                        notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, strategy::FADE_POC, &ot.trade, ot.trust)).await;
                     }
                 }
                 state.today_ct = now_ct;
@@ -381,7 +416,8 @@ async fn main() -> Result<()> {
                 state.cum_dn = 0.0;
                 state.last_completed = None;
                 state.swing_bars.clear();
-                state.locked_today = false;
+                state.ml = StrategySlot::default();
+                state.fade = StrategySlot::default();
                 match train(&pool, symbol, bf.as_deref()).await {
                     Ok(t) => state.trained = t,
                     Err(e) => tracing::error!("{symbol}: retrain failed, keeping yesterday's model: {e}"),
@@ -407,13 +443,15 @@ async fn main() -> Result<()> {
                 state.last_tick_ts = tick.ts;
                 state.tpo.add_trade(tick.price, tick.size.max(0) as u64, tick.ts);
 
-                if let Some(ot) = state.open_trade.as_mut() {
-                    if shadow_trader::on_price(&mut ot.trade, tick.price, tick_size, tick_value).is_some()
-                        && matches!(ot.trade.outcome, Outcome::Won | Outcome::Lost)
-                    {
-                        let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
-                        sound::play(if ot.trade.outcome == Outcome::Won { sound::AlertKind::Won } else { sound::AlertKind::Lost });
-                        notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, &ot.trade)).await;
+                for (slot, slug) in [(&mut state.ml, strategy::ML_MODEL), (&mut state.fade, strategy::FADE_POC)] {
+                    if let Some(ot) = slot.open.as_mut() {
+                        if shadow_trader::on_price(&mut ot.trade, tick.price, tick_size, tick_value).is_some()
+                            && matches!(ot.trade.outcome, Outcome::Won | Outcome::Lost)
+                        {
+                            let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
+                            sound::play(if ot.trade.outcome == Outcome::Won { sound::AlertKind::Won } else { sound::AlertKind::Lost });
+                            notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, slug, &ot.trade, ot.trust)).await;
+                        }
                     }
                 }
 
@@ -430,16 +468,66 @@ async fn main() -> Result<()> {
                         close: finished.close,
                     });
 
-                    if !state.locked_today && state.open_trade.is_none() && state.prior.is_some() {
-                        try_signal(
-                            &pool, &http, &bot_token, &chat_id, nats.as_ref(), symbol,
-                            &risk_cfg, &setup_cfg, state,
-                        )
-                        .await;
+                    if state.prior.is_some() {
+                        if !state.ml.locked_today && state.ml.open.is_none() {
+                            try_signal(
+                                &pool, &http, &bot_token, &chat_id, nats.as_ref(), symbol,
+                                &risk_cfg, &setup_cfg, state,
+                            )
+                            .await;
+                        }
+                        if !state.fade.locked_today && state.fade.open.is_none() {
+                            try_fade_signal(
+                                &pool, &http, &bot_token, &chat_id, nats.as_ref(), symbol,
+                                &risk_cfg, &setup_cfg, state,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+/// Builds the live feature input for the NEXT period from state accumulated
+/// so far today. Shared by both strategies — the fade arm still feeds the
+/// trained model's probabilities into `risk_params` for sizing, exactly as
+/// the validated `backtest_tick_sim_direction.rs` fade arm did, so it needs
+/// the same input.
+fn build_live_input(
+    state: &PerSymbolState,
+    prior_levels: &ProfileLevels,
+    ib_high: Option<Decimal>,
+    ib_low: Option<Decimal>,
+    prev: &PeriodBar,
+) -> LivePeriodInput {
+    let prev_tot = (prev.up_vol + prev.down_vol) as f64;
+    let prev_delta_ratio = if prev_tot > 0.0 { (prev.up_vol - prev.down_vol) as f64 / prev_tot } else { 0.0 };
+    let cum_tot = state.cum_up + state.cum_dn;
+    let cum_delta_ratio = if cum_tot > 0.0 { (state.cum_up - state.cum_dn) / cum_tot } else { 0.0 };
+    let bull_frac = if state.period_count > 0 { state.bull_count as f64 / state.period_count as f64 } else { 0.0 };
+
+    let (swing_highs, swing_lows) =
+        bilore_core::market_structure::find_pivots(&state.swing_bars, bilore_ml_rs::features::SWING_PIVOT_N);
+    LivePeriodInput {
+        period_idx: prev.period_idx + 1,
+        open: prev.close, // best available "current price" — the new period's own open isn't known until it prints a tick
+        ib_high,
+        ib_low,
+        ref_poc: prior_levels.poc,
+        ref_vah: prior_levels.vah,
+        ref_val: prior_levels.val,
+        ref_high: state.prior_hilo.map(|(h, _)| h).unwrap_or(Decimal::ZERO),
+        ref_low: state.prior_hilo.map(|(_, l)| l).unwrap_or(Decimal::ZERO),
+        prev_bullish: prev.close > prev.open,
+        prev_range: prev.high - prev.low,
+        prev_volume: prev.volume,
+        bull_frac,
+        prev_delta_ratio,
+        cum_delta_ratio,
+        nearest_rally_high: swing_highs.last().map(|p| p.price),
+        nearest_pullback_low: swing_lows.last().map(|p| p.price),
     }
 }
 
@@ -469,33 +557,7 @@ async fn try_signal(
         None => return, // no trades recorded yet today — nothing to score against
     };
 
-    let prev_tot = (prev.up_vol + prev.down_vol) as f64;
-    let prev_delta_ratio = if prev_tot > 0.0 { (prev.up_vol - prev.down_vol) as f64 / prev_tot } else { 0.0 };
-    let cum_tot = state.cum_up + state.cum_dn;
-    let cum_delta_ratio = if cum_tot > 0.0 { (state.cum_up - state.cum_dn) / cum_tot } else { 0.0 };
-    let bull_frac = if state.period_count > 0 { state.bull_count as f64 / state.period_count as f64 } else { 0.0 };
-
-    let (swing_highs, swing_lows) =
-        bilore_core::market_structure::find_pivots(&state.swing_bars, bilore_ml_rs::features::SWING_PIVOT_N);
-    let input = LivePeriodInput {
-        period_idx: next_period_idx,
-        open: prev.close, // best available "current price" — the new period's own open isn't known until it prints a tick
-        ib_high,
-        ib_low,
-        ref_poc: prior_levels.poc,
-        ref_vah: prior_levels.vah,
-        ref_val: prior_levels.val,
-        ref_high: state.prior_hilo.map(|(h, _)| h).unwrap_or(Decimal::ZERO),
-        ref_low: state.prior_hilo.map(|(_, l)| l).unwrap_or(Decimal::ZERO),
-        prev_bullish: prev.close > prev.open,
-        prev_range: prev.high - prev.low,
-        prev_volume: prev.volume,
-        bull_frac,
-        prev_delta_ratio,
-        cum_delta_ratio,
-        nearest_rally_high: swing_highs.last().map(|p| p.price),
-        nearest_pullback_low: swing_lows.last().map(|p| p.price),
-    };
+    let input = build_live_input(state, &prior_levels, ib_high, ib_low, &prev);
 
     // TEMP diagnostic (2026-09-14): 7 straight live sessions on MESZ6 fired
     // zero signals despite the backtest predicting ~9% of periods should
@@ -562,6 +624,14 @@ async fn try_signal(
             short_max_loss_ticks: r_short.max_loss_ticks,
             short_max_loss_dollars: r_short.max_loss_dollars,
             lean: format!("{direction:?}"),
+            strategy: strategy::ML_MODEL.to_string(),
+            // Entry trust only exists alongside an actual setup (contracts/
+            // strategies.md, "Trust metric"): ml-model's is the leaned
+            // side's risk_params confidence.
+            entry_trust: match &result {
+                SetupResult::Setup(_) => Some(lean_risk.confidence),
+                SetupResult::NoSetup(_) => None,
+            },
             setup: match &result {
                 SetupResult::Setup(s) => Some(LiveSetup {
                     direction: format!("{:?}", s.direction),
@@ -585,13 +655,13 @@ async fn try_signal(
     let setup = match result {
         SetupResult::Setup(s) => s,
         SetupResult::NoSetup(reason) => {
-            tracing::debug!("{symbol}: no setup for period {next_period_idx}: {reason}");
+            tracing::debug!("{symbol}: no ml-model setup for period {next_period_idx}: {reason}");
             return;
         }
     };
 
     tracing::info!(
-        "{symbol} LOCKED: {:?} entry={} stop={} target={} confidence={:.2} tier={}",
+        "{symbol} LOCKED [ml-model]: {:?} entry={} stop={} target={} confidence={:.2} tier={}",
         setup.direction, setup.entry_price, setup.stop, setup.targets[0].price, lean_risk.confidence, lean_risk.tier_label
     );
 
@@ -599,11 +669,11 @@ async fn try_signal(
     trade.outcome = Outcome::Entered;
     trade.entry_price = Some(setup.entry_price);
 
-    match db::insert_shadow_trade_v2(pool, state.today_ct, symbol, &trade).await {
-        Ok(id) => state.open_trade = Some(OpenTrade { db_id: id, trade }),
+    match db::insert_shadow_trade_v2(pool, state.today_ct, symbol, strategy::ML_MODEL, Some(lean_risk.confidence), &trade).await {
+        Ok(id) => state.ml.open = Some(OpenTrade { db_id: id, trade, trust: lean_risk.confidence }),
         Err(e) => tracing::error!("{symbol}: insert_shadow_trade_v2 failed: {e}"),
     }
-    state.locked_today = true;
+    state.ml.locked_today = true;
 
     if let Some(nc) = nats {
         let state_msg = LiveModelState {
@@ -627,6 +697,8 @@ async fn try_signal(
             short_max_loss_ticks: r_short.max_loss_ticks,
             short_max_loss_dollars: r_short.max_loss_dollars,
             lean: format!("{direction:?}"),
+            strategy: strategy::ML_MODEL.to_string(),
+            entry_trust: Some(lean_risk.confidence),
             setup: Some(LiveSetup {
                 direction: format!("{:?}", setup.direction),
                 entry: setup.entry_price.to_f64().unwrap_or(0.0),
@@ -643,8 +715,182 @@ async fn try_signal(
 
     sound::play(sound::AlertKind::Setup);
     let msg = format!(
-        "🟢 <b>[V2] SETUP — {symbol}</b>\nDirection : <b>{:?}</b>\nEntry     : <b>{:.2}</b>\nStop      : {:.2}\nTarget    : {:.2}\nConfidence: {:.0}% ({})",
+        "🟢 <b>[V2][ml-model] SETUP — {symbol}</b>\nDirection : <b>{:?}</b>\nEntry     : <b>{:.2}</b>\nStop      : {:.2}\nTarget    : {:.2}\nTrust     : {:.0}% ({})",
         setup.direction, setup.entry_price, setup.stop, setup.targets[0].price, lean_risk.confidence * 100.0, lean_risk.tier_label
+    );
+    notify(http, bot_token, chat_id, &msg).await;
+}
+
+/// `fade-poc` strategy (2026-09-18) — same machinery as `try_signal`, with
+/// direction overridden by the fade-toward-POC rule (`bilore_monitor::fade`,
+/// `bilore-project-conf/contracts/strategies.md`). Mirrors the validated
+/// `backtest_tick_sim_direction.rs` fade arm: the trained model's
+/// probabilities still feed `risk_params` sizing — only direction selection
+/// differs. Tracks its own shadow trade in the `state.fade` slot, fully
+/// independent of the `ml-model` slot.
+#[allow(clippy::too_many_arguments)]
+async fn try_fade_signal(
+    pool: &PgPool,
+    http: &reqwest::Client,
+    bot_token: &str,
+    chat_id: &str,
+    nats: Option<&async_nats::Client>,
+    symbol: &str,
+    risk_cfg: &RiskConfig,
+    setup_cfg: &TradeSetupConfig,
+    state: &mut PerSymbolState,
+) {
+    let Some(prev) = state.last_completed else { return };
+    let next_period_idx = prev.period_idx + 1;
+    if next_period_idx > 12 {
+        return; // past the 13-period RTH cap (A-M)
+    }
+
+    let Some(prior_levels) = state.prior else { return };
+
+    let metrics = state.tpo.metrics_for_date(state.today_ct);
+    let (ib_high, ib_low) = match &metrics {
+        Some(m) => (m.ib_high, m.ib_low),
+        None => return, // no trades recorded yet today — nothing to score against
+    };
+
+    let input = build_live_input(state, &prior_levels, ib_high, ib_low, &prev);
+    let probs: Probabilities = predict(&state.trained.models, &state.trained.means, &state.trained.stds, &input);
+    let r_long = risk_params(Direction::Long, &probs, 1, &state.trained.quality, risk_cfg, 1.25);
+    let r_short = risk_params(Direction::Short, &probs, 1, &state.trained.quality, risk_cfg, 1.25);
+
+    // The one difference from try_signal: direction comes from the fade
+    // rule (price vs prior POC), not from which side has higher confidence.
+    let direction = fade::fade_direction(prev.close, prior_levels.poc);
+    let lean_risk = if direction == Direction::Long { r_long.clone() } else { r_short.clone() };
+
+    let result = trade_setup(direction, prev.close, &prior_levels, &lean_risk, None, setup_cfg);
+
+    // Publish the live state (strategy-tagged) regardless of outcome, same
+    // contract as try_signal — the cockpit displays this.
+    if let Some(nc) = nats {
+        let state_msg = LiveModelState {
+            symbol: symbol.to_string(),
+            period_idx: next_period_idx,
+            ts: Utc::now(),
+            p_bullish: probs.p_bullish,
+            p_break_vah: probs.p_break_vah,
+            p_break_val: probs.p_break_val,
+            p_return_poc: probs.p_return_poc,
+            long_confidence: r_long.confidence,
+            long_tier: r_long.tier_label.clone(),
+            long_action: format!("{:?}", r_long.action),
+            long_allowed: r_long.allowed,
+            long_max_loss_ticks: r_long.max_loss_ticks,
+            long_max_loss_dollars: r_long.max_loss_dollars,
+            short_confidence: r_short.confidence,
+            short_tier: r_short.tier_label.clone(),
+            short_action: format!("{:?}", r_short.action),
+            short_allowed: r_short.allowed,
+            short_max_loss_ticks: r_short.max_loss_ticks,
+            short_max_loss_dollars: r_short.max_loss_dollars,
+            lean: format!("{direction:?}"),
+            strategy: strategy::FADE_POC.to_string(),
+            // Entry trust only exists alongside an actual setup
+            // (contracts/strategies.md, "Trust metric"): fade-poc's is the
+            // POC-extension score — 50% at the prior POC, 100% a full stop
+            // beyond it.
+            entry_trust: match &result {
+                SetupResult::Setup(s) =>
+                    Some(fade::fade_trust(prev.close, prior_levels.poc, (s.stop - s.entry_price).abs())),
+                SetupResult::NoSetup(_) => None,
+            },
+            setup: match &result {
+                SetupResult::Setup(s) => Some(LiveSetup {
+                    direction: format!("{:?}", s.direction),
+                    entry: s.entry_price.to_f64().unwrap_or(0.0),
+                    stop: s.stop.to_f64().unwrap_or(0.0),
+                    target: s.targets[0].price.to_f64().unwrap_or(0.0),
+                }),
+                SetupResult::NoSetup(_) => None,
+            },
+            locked: false, // set true below if this one actually gets locked
+            reason: match &result {
+                SetupResult::NoSetup(reason) => Some(reason.clone()),
+                SetupResult::Setup(_) => None,
+            },
+        };
+        if let Ok(payload) = serde_json::to_vec(&state_msg) {
+            let _ = nc.publish(bilore_ml_rs::live_state::subject(symbol), payload.into()).await;
+        }
+    }
+
+    let setup = match result {
+        SetupResult::Setup(s) => s,
+        SetupResult::NoSetup(reason) => {
+            tracing::debug!("{symbol}: no fade-poc setup for period {next_period_idx}: {reason}");
+            return;
+        }
+    };
+
+    tracing::info!(
+        "{symbol} LOCKED [fade-poc]: {:?} entry={} stop={} target={} (prior POC={}, close {})",
+        setup.direction, setup.entry_price, setup.stop, setup.targets[0].price,
+        prior_levels.poc, if prev.close > prior_levels.poc { "above" } else { "at/below" }
+    );
+
+    // Entry trust (contracts/strategies.md, "Trust metric"): how far price
+    // extended beyond the prior POC relative to the stop distance.
+    let trust = fade::fade_trust(prev.close, prior_levels.poc, (setup.stop - setup.entry_price).abs());
+
+    let mut trade = ShadowTrade::new(direction, setup.entry_price, setup.entry_price, setup.stop, Some(setup.targets[0].price), 1, true);
+    trade.outcome = Outcome::Entered;
+    trade.entry_price = Some(setup.entry_price);
+
+    match db::insert_shadow_trade_v2(pool, state.today_ct, symbol, strategy::FADE_POC, Some(trust), &trade).await {
+        Ok(id) => state.fade.open = Some(OpenTrade { db_id: id, trade, trust }),
+        Err(e) => tracing::error!("{symbol}: insert_shadow_trade_v2 (fade-poc) failed: {e}"),
+    }
+    state.fade.locked_today = true;
+
+    if let Some(nc) = nats {
+        let state_msg = LiveModelState {
+            symbol: symbol.to_string(),
+            period_idx: next_period_idx,
+            ts: Utc::now(),
+            p_bullish: probs.p_bullish,
+            p_break_vah: probs.p_break_vah,
+            p_break_val: probs.p_break_val,
+            p_return_poc: probs.p_return_poc,
+            long_confidence: r_long.confidence,
+            long_tier: r_long.tier_label.clone(),
+            long_action: format!("{:?}", r_long.action),
+            long_allowed: r_long.allowed,
+            long_max_loss_ticks: r_long.max_loss_ticks,
+            long_max_loss_dollars: r_long.max_loss_dollars,
+            short_confidence: r_short.confidence,
+            short_tier: r_short.tier_label.clone(),
+            short_action: format!("{:?}", r_short.action),
+            short_allowed: r_short.allowed,
+            short_max_loss_ticks: r_short.max_loss_ticks,
+            short_max_loss_dollars: r_short.max_loss_dollars,
+            lean: format!("{direction:?}"),
+            strategy: strategy::FADE_POC.to_string(),
+            entry_trust: Some(trust),
+            setup: Some(LiveSetup {
+                direction: format!("{:?}", setup.direction),
+                entry: setup.entry_price.to_f64().unwrap_or(0.0),
+                stop: setup.stop.to_f64().unwrap_or(0.0),
+                target: setup.targets[0].price.to_f64().unwrap_or(0.0),
+            }),
+            locked: true,
+            reason: None,
+        };
+        if let Ok(payload) = serde_json::to_vec(&state_msg) {
+            let _ = nc.publish(bilore_ml_rs::live_state::subject(symbol), payload.into()).await;
+        }
+    }
+
+    sound::play(sound::AlertKind::Setup);
+    let msg = format!(
+        "🟢 <b>[V2][fade-poc] SETUP — {symbol}</b>\nDirection : <b>{:?}</b>\nEntry     : <b>{:.2}</b>\nStop      : {:.2}\nTarget    : {:.2}\nPrior POC : {:.2} (close {})\nTrust     : {:.0}%",
+        setup.direction, setup.entry_price, setup.stop, setup.targets[0].price, prior_levels.poc,
+        if prev.close > prior_levels.poc { "above" } else { "at/below" }, trust * 100.0
     );
     notify(http, bot_token, chat_id, &msg).await;
 }
