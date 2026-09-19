@@ -42,22 +42,28 @@ fn outcome_icon(outcome: Outcome) -> &'static str {
     }
 }
 
-pub fn result_message(symbol: &str, trade: &ShadowTrade) -> String {
+/// `trust` is the strategy's entry-trust score (0..1) captured when the
+/// trade was locked — same value persisted to `shadow_trades_v2.confidence`
+/// (see contracts/strategies.md, "Trust metric").
+pub fn result_message(symbol: &str, strategy: &str, trade: &ShadowTrade, trust: f64) -> String {
     let pnl = match (trade.pnl_ticks, trade.pnl_dollars) {
         (Some(t), Some(d)) => format!("{t:+.1}t  ${d:+.2}"),
         _ => "—".to_string(),
     };
     format!(
-        "{} <b>[V2] {} — {symbol}</b>\n\
+        "{} <b>[V2][{}] {} — {symbol}</b>\n\
          Direction : {}\n\
          Entry     : {}\n\
          Exit      : {}\n\
+         Trust     : {:.0}%\n\
          P&L       : {pnl}",
         outcome_icon(trade.outcome),
+        strategy,
         trade.outcome.as_str().to_uppercase(),
         direction_str(trade.direction),
         fmt_opt(trade.entry_price),
         fmt_opt(trade.exit_price),
+        trust * 100.0,
     )
 }
 
@@ -129,17 +135,19 @@ mod tests {
 
     #[test]
     fn result_message_shows_won_outcome_and_pnl() {
-        let msg = result_message("MESU6", &trade(Outcome::Won, "5000", "5010", "40", "50.00"));
-        assert!(msg.contains("[V2] WON — MESU6"));
+        let msg = result_message("MESU6", "ml-model", &trade(Outcome::Won, "5000", "5010", "40", "50.00"), 0.62);
+        assert!(msg.contains("[V2][ml-model] WON — MESU6"));
         assert!(msg.contains("+40.0t"));
         assert!(msg.contains("$+50.00"));
+        assert!(msg.contains("Trust     : 62%"));
         assert!(msg.contains('✅'));
     }
 
     #[test]
     fn result_message_shows_lost_outcome() {
-        let msg = result_message("MESU6", &trade(Outcome::Lost, "5000", "4995", "-20", "-25.00"));
-        assert!(msg.contains("[V2] LOST — MESU6"));
+        let msg = result_message("MESU6", "fade-poc", &trade(Outcome::Lost, "5000", "4995", "-20", "-25.00"), 0.75);
+        assert!(msg.contains("[V2][fade-poc] LOST — MESU6"));
+        assert!(msg.contains("Trust     : 75%"));
         assert!(msg.contains('❌'));
     }
 }

@@ -22,7 +22,7 @@ flowchart LR
 | Symbol | Purpose | Tests |
 |---|---|---|
 | `setup_message()` | Direction/entry/stop/target + whether order_flow also confirmed | `setup_message_includes_symbol_direction_and_prices`, `setup_message_shows_confirmed_state` |
-| `result_message()` | Won/Lost/Expired icon + entry/exit/PnL | `result_message_shows_won_outcome_and_pnl`, `result_message_shows_lost_outcome` |
+| `result_message()` | Won/Lost/Expired icon + entry/exit + entry trust (`Trust: NN%` — the 0..1 score captured at lock time, same value persisted to `shadow_trades_v2.confidence`; semantics per strategy, contracts/strategies.md "Trust metric") + PnL | `result_message_shows_won_outcome_and_pnl`, `result_message_shows_lost_outcome` |
 | `send()` | POSTs to the Telegram Bot API, HTML parse mode (matches v1's convention) | not tested — network I/O |
 
 ## Known deviations / scope notes

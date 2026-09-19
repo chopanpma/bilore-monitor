@@ -9,6 +9,7 @@ via `git config core.hooksPath .githooks`). `db.rs` (DB I/O) and `main.rs`
 |---|---|---|
 | `period_agg.rs` | done | [period_agg.md](period_agg.md) |
 | `live_signal.rs` | done, superseded (see below) | [live_signal.md](live_signal.md) |
+| `fade.rs` | done (2026-09-18 — `fade-poc` strategy) | [fade.md](fade.md) |
 | `telegram.rs` | done | [telegram.md](telegram.md) |
 | `sound.rs` | done | [sound.md](sound.md) |
 | `db.rs` | exempt (I/O) | — |
@@ -75,7 +76,8 @@ Run: `SYMBOL=MESU6 DATABASE_URL=postgres://bilore:bilore@localhost:5432/bilore c
   to know "has the CT calendar day rolled over" continuously, in memory,
   with no DB round-trip appropriate for every 1s tick — a real, justified
   exception to that convention, not an oversight.
-- One shadow trade tracked per session — no re-signal once locked, matching
+- One shadow trade tracked per session **per strategy** (`ml-model`,
+  `fade-poc` — each its own slot/lock) — no re-signal once locked, matching
   v1's one-setup-per-day semantics. Unlike v1, there's no "unlock on lean
   flip" here (that concept existed in the superseded `live_signal.rs`
   version; not carried over — a simplification, not an oversight).
