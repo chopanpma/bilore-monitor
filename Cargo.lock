@@ -152,6 +152,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "rust_decimal",
+ "rust_decimal_macros",
  "sqlx",
  "tokio",
 ]

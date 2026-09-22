@@ -6,6 +6,15 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
+
+/// How many times `play()` repeats the sound, and the gap between repeats.
+/// One `afplay` on a short system sound was easy to miss on a busy
+/// morning — user request 2026-09-22: "make the v2 alerts more
+/// prolonged, play the sound 3 times." 700ms comfortably outlasts these
+/// sounds' own length (well under 1s) so repeats never overlap/garble.
+const REPEAT_COUNT: u32 = 3;
+const REPEAT_GAP: Duration = Duration::from_millis(700);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlertKind {
@@ -29,6 +38,12 @@ fn sounds_for(kind: AlertKind) -> [&'static str; 2] {
 /// Non-blocking, best-effort — a missing sound file or a non-macOS host
 /// (no `afplay`) just means silence, never an error that interrupts the
 /// monitor. Matches v1's own defensive `Path(sound).exists()` check.
+///
+/// Plays `REPEAT_COUNT` times, `REPEAT_GAP` apart, on a dedicated OS
+/// thread — not a tokio task, since this module otherwise has no async
+/// runtime dependency at all and the repeat loop is just a few blocking
+/// sleeps between fire-and-forget `Command::spawn()` calls. The caller
+/// (the async monitor loop) returns immediately either way.
 pub fn play(kind: AlertKind) {
     let [primary, fallback] = sounds_for(kind);
     let sound = if Path::new(primary).exists() {
@@ -38,7 +53,15 @@ pub fn play(kind: AlertKind) {
     } else {
         return;
     };
-    let _ = Command::new("afplay").arg(sound).spawn();
+    let sound = sound.to_string();
+    std::thread::spawn(move || {
+        for i in 0..REPEAT_COUNT {
+            let _ = Command::new("afplay").arg(&sound).spawn();
+            if i + 1 < REPEAT_COUNT {
+                std::thread::sleep(REPEAT_GAP);
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -51,6 +74,14 @@ mod tests {
         let primaries: Vec<&str> = kinds.iter().map(|k| sounds_for(*k)[0]).collect();
         let unique: std::collections::HashSet<&&str> = primaries.iter().collect();
         assert_eq!(unique.len(), primaries.len(), "expected all primary sounds to be distinct");
+    }
+
+    #[test]
+    fn repeats_three_times_with_a_gap_that_outlasts_a_short_system_sound() {
+        assert_eq!(REPEAT_COUNT, 3);
+        // These are all well under 1s; the gap must clear that so repeats
+        // don't overlap/garble into each other.
+        assert!(REPEAT_GAP >= Duration::from_millis(500));
     }
 
     #[test]
