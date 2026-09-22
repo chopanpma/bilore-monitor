@@ -43,7 +43,7 @@ use bilore_core::market_structure::Direction;
 use bilore_core::shadow_trader::{self, Outcome, ShadowTrade};
 use bilore_core::strategy;
 use bilore_ml_rs::model::{Config as ModelConfig, LogisticModel};
-use bilore_ml_rs::predict::{feature_vector, predict, LivePeriodInput};
+use bilore_ml_rs::predict::{predict, LivePeriodInput};
 use bilore_ml_rs::risk::{risk_params, ModelQuality, Probabilities, RiskConfig};
 use bilore_ml_rs::trade_setup::{trade_setup, ProfileLevels, SetupResult, TradeSetupConfig};
 use bilore_ml_rs::{db as ml_db, features};
@@ -116,6 +116,12 @@ struct PerSymbolState {
     swing_bars: Vec<bilore_core::market_structure::Bar>,
     last_bar_ts: DateTime<Utc>,
     last_tick_ts: DateTime<Utc>,
+    /// This symbol's real contract economics (`bilore_monitor::economics`)
+    /// — MNQZ6's shadow trades were computing PnL at MES's $1.25/tick
+    /// instead of its own $0.50/tick before this existed (found
+    /// 2026-09-22). `tick_value` is also handed to `risk_params` as `f64`.
+    tick_size: Decimal,
+    tick_value: Decimal,
     /// `ml-model` slot — the ML pipeline's shadow trade (see `try_signal`).
     ml: StrategySlot,
     /// `fade-poc` slot — the fade-toward-POC rule's shadow trade
@@ -258,6 +264,7 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
     let prior = fetch_prior_session(pool, symbol, today_ct, bridge_from).await?;
     let prior_hilo = fetch_prior_hilo(pool, symbol, today_ct, bridge_from).await?;
     let start = Utc::now() - ChronoDuration::hours(12);
+    let (tick_size, tick_value) = bilore_monitor::economics::tick_economics(symbol);
     Ok(PerSymbolState {
         trained,
         today_ct,
@@ -273,6 +280,8 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
         swing_bars: Vec::new(),
         last_bar_ts: start,
         last_tick_ts: start,
+        tick_size,
+        tick_value,
         ml: StrategySlot::default(),
         fade: StrategySlot::default(),
     })
@@ -280,8 +289,6 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let ml_env = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../bilore-ml/.env");
-    dotenvy::from_path(&ml_env).ok();
     dotenvy::dotenv().ok();
 
     let log_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("logs/monitor.log");
@@ -333,8 +340,6 @@ async fn main() -> Result<()> {
         }
     };
 
-    let tick_size: Decimal = "0.25".parse().unwrap();
-    let tick_value: Decimal = "1.25".parse().unwrap();
     let risk_cfg = RiskConfig::default();
     let setup_cfg = TradeSetupConfig::default();
 
@@ -445,7 +450,7 @@ async fn main() -> Result<()> {
 
                 for (slot, slug) in [(&mut state.ml, strategy::ML_MODEL), (&mut state.fade, strategy::FADE_POC)] {
                     if let Some(ot) = slot.open.as_mut() {
-                        if shadow_trader::on_price(&mut ot.trade, tick.price, tick_size, tick_value).is_some()
+                        if shadow_trader::on_price(&mut ot.trade, tick.price, state.tick_size, state.tick_value).is_some()
                             && matches!(ot.trade.outcome, Outcome::Won | Outcome::Lost)
                         {
                             let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
@@ -559,40 +564,15 @@ async fn try_signal(
 
     let input = build_live_input(state, &prior_levels, ib_high, ib_low, &prev);
 
-    // TEMP diagnostic (2026-09-14): 7 straight live sessions on MESZ6 fired
-    // zero signals despite the backtest predicting ~9% of periods should
-    // qualify. Logging raw features + their standardized (training-mean-
-    // relative) form side by side to find which input, if any, is staying
-    // artificially flat across periods live — confidence alone doesn't show
-    // that. Now per-symbol (2026-09-16) since MNQZ6/NQZ6 need the same
-    // visibility once they come online. Remove once the mystery's resolved.
-    let raw = feature_vector(&input);
-    let names = [
-        "period_idx", "prev_bullish", "prev_range", "prev_vol_log", "dist_poc",
-        "dist_vah", "dist_val", "bull_frac", "ib_width", "prev_delta_ratio", "cum_delta_ratio",
-        "dist_rally_high", "dist_pullback_low", "dist_prior_high", "dist_prior_low",
-        "prior_va_width", "prior_poc_position",
-    ];
-    let feat_dump: String = names
-        .iter()
-        .zip(raw.iter())
-        .enumerate()
-        .map(|(i, (name, v))| {
-            let z = (v - state.trained.means[i]) / state.trained.stds[i];
-            format!("{name}={v:.5}(z={z:+.2})")
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    tracing::debug!("{symbol} period {next_period_idx} features: {feat_dump}");
-
     let probs: Probabilities = predict(&state.trained.models, &state.trained.means, &state.trained.stds, &input);
     tracing::debug!(
         "{symbol} period {next_period_idx} probs: bullish={:.3} break_vah={:.3} break_val={:.3} return_poc={:.3}",
         probs.p_bullish, probs.p_break_vah, probs.p_break_val, probs.p_return_poc
     );
 
-    let r_long = risk_params(Direction::Long, &probs, 1, &state.trained.quality, risk_cfg, 1.25);
-    let r_short = risk_params(Direction::Short, &probs, 1, &state.trained.quality, risk_cfg, 1.25);
+    let tick_value_f64 = state.tick_value.to_f64().unwrap_or(1.25);
+    let r_long = risk_params(Direction::Long, &probs, 1, &state.trained.quality, risk_cfg, tick_value_f64);
+    let r_short = risk_params(Direction::Short, &probs, 1, &state.trained.quality, risk_cfg, tick_value_f64);
     let (direction, lean_risk) =
         if r_long.confidence >= r_short.confidence { (Direction::Long, r_long.clone()) } else { (Direction::Short, r_short.clone()) };
 
@@ -756,8 +736,9 @@ async fn try_fade_signal(
 
     let input = build_live_input(state, &prior_levels, ib_high, ib_low, &prev);
     let probs: Probabilities = predict(&state.trained.models, &state.trained.means, &state.trained.stds, &input);
-    let r_long = risk_params(Direction::Long, &probs, 1, &state.trained.quality, risk_cfg, 1.25);
-    let r_short = risk_params(Direction::Short, &probs, 1, &state.trained.quality, risk_cfg, 1.25);
+    let tick_value_f64 = state.tick_value.to_f64().unwrap_or(1.25);
+    let r_long = risk_params(Direction::Long, &probs, 1, &state.trained.quality, risk_cfg, tick_value_f64);
+    let r_short = risk_params(Direction::Short, &probs, 1, &state.trained.quality, risk_cfg, tick_value_f64);
 
     // The one difference from try_signal: direction comes from the fade
     // rule (price vs prior POC), not from which side has higher confidence.
