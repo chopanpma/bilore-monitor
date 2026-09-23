@@ -85,6 +85,16 @@ struct StrategySlot {
     /// price already checked. Resets for free on session rollover along
     /// with the rest of this slot (`StrategySlot::default()`).
     last_checked_price: Option<Decimal>,
+    /// `fade-poc` only: last `NoSetup` reason actually logged, so the
+    /// per-tick trigger doesn't spam `monitor.log` with one line per tick —
+    /// `risk_params`' confidence (and so the rejection reason) is constant
+    /// across an entire period regardless of price, so without this a
+    /// restart's backlog replay logged the exact same line thousands of
+    /// times in a few seconds (found live 2026-09-23, right after shipping
+    /// the per-tick trigger). Only the transition to a genuinely different
+    /// reason gets logged now; the NATS publish itself is untouched — still
+    /// fires every tick, since the cockpit just wants the freshest state.
+    last_logged_reason: Option<String>,
 }
 
 struct TrainedModel {
@@ -838,7 +848,10 @@ async fn try_fade_signal(
     let setup = match result {
         SetupResult::Setup(s) => s,
         SetupResult::NoSetup(reason) => {
-            tracing::debug!("{symbol}: no fade-poc setup for period {next_period_idx}: {reason}");
+            if state.fade.last_logged_reason.as_deref() != Some(reason.as_str()) {
+                tracing::debug!("{symbol}: no fade-poc setup for period {next_period_idx}: {reason}");
+                state.fade.last_logged_reason = Some(reason);
+            }
             return;
         }
     };
