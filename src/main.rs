@@ -80,6 +80,11 @@ struct OpenTrade {
 struct StrategySlot {
     open: Option<OpenTrade>,
     locked_today: bool,
+    /// `fade-poc` only (2026-09-23): dedup guard for the per-tick live
+    /// trigger — skips redundant evaluation when a tick repeats the last
+    /// price already checked. Resets for free on session rollover along
+    /// with the rest of this slot (`StrategySlot::default()`).
+    last_checked_price: Option<Decimal>,
 }
 
 struct TrainedModel {
@@ -460,6 +465,30 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                // fade-poc (2026-09-23): checked on every live tick, not
+                // just at period boundaries — its direction rule
+                // (fade::fade_direction) is already a pure function of live
+                // price vs. the prior session's static POC, so it doesn't
+                // need to wait for a period to close to react. ml-model
+                // stays period-boundary-only below (its direction depends
+                // on predict()'s period-level features, which would need
+                // retraining to react faster — see
+                // bilore-project-conf/contracts/strategies.md). Dedup guard
+                // avoids redundant evaluation on repeated-price ticks.
+                if state.prior.is_some()
+                    && state.last_completed.is_some()
+                    && !state.fade.locked_today
+                    && state.fade.open.is_none()
+                    && state.fade.last_checked_price != Some(tick.price)
+                {
+                    state.fade.last_checked_price = Some(tick.price);
+                    try_fade_signal(
+                        &pool, &http, &bot_token, &chat_id, nats.as_ref(), symbol,
+                        &risk_cfg, &setup_cfg, tick.price, state,
+                    )
+                    .await;
+                }
+
                 if let Some(finished) = state.period_agg.on_tick(tick) {
                     state.cum_up += finished.up_vol as f64;
                     state.cum_dn += finished.down_vol as f64;
@@ -473,21 +502,12 @@ async fn main() -> Result<()> {
                         close: finished.close,
                     });
 
-                    if state.prior.is_some() {
-                        if !state.ml.locked_today && state.ml.open.is_none() {
-                            try_signal(
-                                &pool, &http, &bot_token, &chat_id, nats.as_ref(), symbol,
-                                &risk_cfg, &setup_cfg, state,
-                            )
-                            .await;
-                        }
-                        if !state.fade.locked_today && state.fade.open.is_none() {
-                            try_fade_signal(
-                                &pool, &http, &bot_token, &chat_id, nats.as_ref(), symbol,
-                                &risk_cfg, &setup_cfg, state,
-                            )
-                            .await;
-                        }
+                    if state.prior.is_some() && !state.ml.locked_today && state.ml.open.is_none() {
+                        try_signal(
+                            &pool, &http, &bot_token, &chat_id, nats.as_ref(), symbol,
+                            &risk_cfg, &setup_cfg, state,
+                        )
+                        .await;
                     }
                 }
             }
@@ -708,6 +728,18 @@ async fn try_signal(
 /// probabilities still feed `risk_params` sizing — only direction selection
 /// differs. Tracks its own shadow trade in the `state.fade` slot, fully
 /// independent of the `ml-model` slot.
+///
+/// **Live-tick triggering (2026-09-23):** called on every live tick now
+/// (see the call site in the tick loop), not just at period boundaries —
+/// `live_price` is the actual current tick price, used as both the fade
+/// rule's direction input and the `trade_setup` entry anchor. `predict()`/
+/// `risk_params` still score against `prev` (`state.last_completed`, the
+/// last *completed* period) exactly as before — only the entry side moved
+/// to live price, deliberately leaving `ml-model`'s period cadence
+/// untouched for a clean A/B. This is a new, not-yet-independently-
+/// backtested variant of the rule — see
+/// `bilore-project-conf/contracts/strategies.md`'s "Known deviations"
+/// section.
 #[allow(clippy::too_many_arguments)]
 async fn try_fade_signal(
     pool: &PgPool,
@@ -718,6 +750,7 @@ async fn try_fade_signal(
     symbol: &str,
     risk_cfg: &RiskConfig,
     setup_cfg: &TradeSetupConfig,
+    live_price: Decimal,
     state: &mut PerSymbolState,
 ) {
     let Some(prev) = state.last_completed else { return };
@@ -741,11 +774,12 @@ async fn try_fade_signal(
     let r_short = risk_params(Direction::Short, &probs, 1, &state.trained.quality, risk_cfg, tick_value_f64);
 
     // The one difference from try_signal: direction comes from the fade
-    // rule (price vs prior POC), not from which side has higher confidence.
-    let direction = fade::fade_direction(prev.close, prior_levels.poc);
+    // rule (live price vs prior POC), not from which side has higher
+    // confidence.
+    let direction = fade::fade_direction(live_price, prior_levels.poc);
     let lean_risk = if direction == Direction::Long { r_long.clone() } else { r_short.clone() };
 
-    let result = trade_setup(direction, prev.close, &prior_levels, &lean_risk, None, setup_cfg);
+    let result = trade_setup(direction, live_price, &prior_levels, &lean_risk, None, setup_cfg);
 
     // Publish the live state (strategy-tagged) regardless of outcome, same
     // contract as try_signal — the cockpit displays this.
@@ -778,7 +812,7 @@ async fn try_fade_signal(
             // beyond it.
             entry_trust: match &result {
                 SetupResult::Setup(s) =>
-                    Some(fade::fade_trust(prev.close, prior_levels.poc, (s.stop - s.entry_price).abs())),
+                    Some(fade::fade_trust(live_price, prior_levels.poc, (s.stop - s.entry_price).abs())),
                 SetupResult::NoSetup(_) => None,
             },
             setup: match &result {
@@ -810,14 +844,14 @@ async fn try_fade_signal(
     };
 
     tracing::info!(
-        "{symbol} LOCKED [fade-poc]: {:?} entry={} stop={} target={} (prior POC={}, close {})",
+        "{symbol} LOCKED [fade-poc]: {:?} entry={} stop={} target={} (prior POC={}, live price {})",
         setup.direction, setup.entry_price, setup.stop, setup.targets[0].price,
-        prior_levels.poc, if prev.close > prior_levels.poc { "above" } else { "at/below" }
+        prior_levels.poc, if live_price > prior_levels.poc { "above" } else { "at/below" }
     );
 
     // Entry trust (contracts/strategies.md, "Trust metric"): how far price
     // extended beyond the prior POC relative to the stop distance.
-    let trust = fade::fade_trust(prev.close, prior_levels.poc, (setup.stop - setup.entry_price).abs());
+    let trust = fade::fade_trust(live_price, prior_levels.poc, (setup.stop - setup.entry_price).abs());
 
     let mut trade = ShadowTrade::new(direction, setup.entry_price, setup.entry_price, setup.stop, Some(setup.targets[0].price), 1, true);
     trade.outcome = Outcome::Entered;
@@ -869,9 +903,9 @@ async fn try_fade_signal(
 
     sound::play(sound::AlertKind::Setup);
     let msg = format!(
-        "🟢 <b>[V2][fade-poc] SETUP — {symbol}</b>\nDirection : <b>{:?}</b>\nEntry     : <b>{:.2}</b>\nStop      : {:.2}\nTarget    : {:.2}\nPrior POC : {:.2} (close {})\nTrust     : {:.0}%",
+        "🟢 <b>[V2][fade-poc] SETUP — {symbol}</b>\nDirection : <b>{:?}</b>\nEntry     : <b>{:.2}</b>\nStop      : {:.2}\nTarget    : {:.2}\nPrior POC : {:.2} (live price {})\nTrust     : {:.0}%",
         setup.direction, setup.entry_price, setup.stop, setup.targets[0].price, prior_levels.poc,
-        if prev.close > prior_levels.poc { "above" } else { "at/below" }, trust * 100.0
+        if live_price > prior_levels.poc { "above" } else { "at/below" }, trust * 100.0
     );
     notify(http, bot_token, chat_id, &msg).await;
 }
