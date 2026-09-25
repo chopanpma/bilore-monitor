@@ -48,7 +48,7 @@ use bilore_ml_rs::risk::{risk_params, ModelQuality, Probabilities, RiskConfig};
 use bilore_ml_rs::trade_setup::{trade_setup, ProfileLevels, SetupResult, TradeSetupConfig};
 use bilore_ml_rs::{db as ml_db, features};
 use bilore_ml_rs::live_state::{LiveModelState, LiveSetup};
-use bilore_monitor::fade;
+use bilore_core::fade;
 use bilore_monitor::period_agg::{PeriodAggregator, PeriodBar};
 use bilore_monitor::{db, sound, telegram};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};

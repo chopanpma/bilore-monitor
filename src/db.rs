@@ -69,7 +69,7 @@ pub async fn poll_new_ticks(pool: &PgPool, symbol: &str, since: DateTime<Utc>) -
 /// carries the strategy's entry trust (0..1, signal-time — semantics per
 /// strategy in `bilore-project-conf/contracts/strategies.md`, "Trust
 /// metric": ml-model = leaned-side `risk_params.confidence`, fade-poc =
-/// `fade::fade_trust`).
+/// `bilore_core::fade::fade_trust`).
 /// `strategy` is the `bilore_core::strategy` slug identifying which of the
 /// monitor's strategies locked this trade (see
 /// `bilore-project-conf/contracts/strategies.md`).
