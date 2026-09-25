@@ -215,8 +215,11 @@ dependencies = [
  "anyhow",
  "bilore-core",
  "chrono",
+ "chrono-tz",
+ "csv",
  "dotenvy",
  "rust_decimal",
+ "serde",
  "sqlx",
  "tokio",
 ]

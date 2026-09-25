@@ -9,7 +9,7 @@ via `git config core.hooksPath .githooks`). `db.rs` (DB I/O) and `main.rs`
 |---|---|---|
 | `period_agg.rs` | done | [period_agg.md](period_agg.md) |
 | `live_signal.rs` | done, superseded (see below) | [live_signal.md](live_signal.md) |
-| `fade.rs` | done (2026-09-18 — `fade-poc` strategy) | [fade.md](fade.md) |
+| `fade.rs` | moved to `bilore-core::fade` 2026-09-25 (shared with bilore-cockpit) | [bilore-core/docs/fade.md](../../bilore-core/docs/fade.md) |
 | `telegram.rs` | done | [telegram.md](telegram.md) |
 | `sound.rs` | done | [sound.md](sound.md) |
 | `economics.rs` | done (2026-09-22 — per-symbol tick economics) | [economics.md](economics.md) |

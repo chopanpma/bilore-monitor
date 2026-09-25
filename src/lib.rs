@@ -1,6 +1,5 @@
 pub mod db;
 pub mod economics;
-pub mod fade;
 pub mod live_signal;
 pub mod period_agg;
 pub mod sound;

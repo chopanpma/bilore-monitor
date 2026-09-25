@@ -69,7 +69,7 @@ pub async fn poll_new_ticks(pool: &PgPool, symbol: &str, since: DateTime<Utc>) -
 /// carries the strategy's entry trust (0..1, signal-time — semantics per
 /// strategy in `bilore-project-conf/contracts/strategies.md`, "Trust
 /// metric": ml-model = leaned-side `risk_params.confidence`, fade-poc =
-/// `fade::fade_trust`).
+/// `bilore_core::fade::fade_trust`).
 /// `strategy` is the `bilore_core::strategy` slug identifying which of the
 /// monitor's strategies locked this trade (see
 /// `bilore-project-conf/contracts/strategies.md`).
@@ -119,7 +119,7 @@ pub async fn update_shadow_trade_v2(pool: &PgPool, id: i64, trade: &ShadowTrade)
                pnl_dollars = $5,
                entry_at    = CASE WHEN $1 IN ('entered','won','lost') AND entry_at IS NULL
                                   THEN NOW() ELSE entry_at END,
-               exit_at     = CASE WHEN $1 IN ('won','lost','expired') AND exit_at IS NULL
+               exit_at     = CASE WHEN $1 IN ('won','lost','expired','invalidated') AND exit_at IS NULL
                                   THEN NOW() ELSE exit_at END
         WHERE  id = $6
         "#,
@@ -133,5 +133,16 @@ pub async fn update_shadow_trade_v2(pool: &PgPool, id: i64, trade: &ShadowTrade)
     .execute(pool)
     .await?;
 
+    Ok(())
+}
+
+/// Free-text reason on a `shadow_trades_v2` row — used for why a pending
+/// setup was invalidated (`notes` column, migration 010).
+pub async fn set_shadow_trade_v2_notes(pool: &PgPool, id: i64, notes: &str) -> Result<()> {
+    sqlx::query("UPDATE shadow_trades_v2 SET notes = $1 WHERE id = $2")
+        .bind(notes)
+        .bind(id as i32)
+        .execute(pool)
+        .await?;
     Ok(())
 }
