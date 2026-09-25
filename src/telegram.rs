@@ -67,6 +67,20 @@ pub fn result_message(symbol: &str, strategy: &str, trade: &ShadowTrade, trust: 
     )
 }
 
+/// A pending setup cancelled before it ever filled
+/// (`shadow_trader::invalidate_on_direction_flip`) — no P&L, just what it
+/// was and why. The strategy re-arms, so another SETUP may follow.
+pub fn invalidated_message(symbol: &str, strategy: &str, trade: &ShadowTrade, reason: &str) -> String {
+    format!(
+        "🚫 <b>[V2][{strategy}] INVALIDATED — {symbol}</b>\n\
+         Direction : {}\n\
+         Entry     : {:.2} (never filled)\n\
+         Why       : {reason}",
+        direction_str(trade.direction),
+        trade.entry_lo,
+    )
+}
+
 fn fmt_opt(v: Option<Decimal>) -> String {
     v.map(|d| format!("{d:.2}")).unwrap_or_else(|| "—".to_string())
 }
@@ -149,5 +163,25 @@ mod tests {
         assert!(msg.contains("[V2][fade-poc] LOST — MESU6"));
         assert!(msg.contains("Trust     : 75%"));
         assert!(msg.contains('❌'));
+    }
+
+    #[test]
+    fn invalidated_message_names_the_setup_and_why_it_was_cancelled() {
+        let mut t = ShadowTrade::new(
+            Direction::Short,
+            "5812.25".parse().unwrap(),
+            "5812.25".parse().unwrap(),
+            "5822.25".parse().unwrap(),
+            Some("5792.25".parse().unwrap()),
+            1,
+            true,
+        );
+        t.outcome = Outcome::Invalidated;
+        let msg = invalidated_message("MESZ6", "fade-poc-fill", &t, "direction flipped to LONG");
+        assert!(msg.contains("[V2][fade-poc-fill] INVALIDATED — MESZ6"), "{msg}");
+        assert!(msg.contains("SHORT"), "{msg}");
+        assert!(msg.contains("5812.25"), "{msg}");
+        assert!(msg.contains("never filled"), "{msg}");
+        assert!(msg.contains("direction flipped to LONG"), "{msg}");
     }
 }

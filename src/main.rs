@@ -14,7 +14,8 @@
 //! pipeline (`ml-model`) plus the fade-toward-POC rule (`fade-poc`,
 //! model-analysis.md §6.10's live lead — see `fade.rs`). Each has its own
 //! open-trade slot and one-trade-per-session lock, so neither suppresses
-//! the other's signals; every `shadow_trades_v2` row and Telegram alert
+//! the other's signals (a setup cancelled before it fills — see
+//! `StrategySlot::invalidate_on_direction_flip` — releases that lock); every `shadow_trades_v2` row and Telegram alert
 //! carries its strategy label (`bilore_core::strategy`,
 //! contracts/strategies.md).
 //!
@@ -44,7 +45,7 @@ use bilore_core::shadow_trader::{self, Outcome, ShadowTrade};
 use bilore_core::strategy;
 use bilore_ml_rs::model::{Config as ModelConfig, LogisticModel};
 use bilore_ml_rs::predict::{predict, LivePeriodInput};
-use bilore_ml_rs::risk::{risk_params, ModelQuality, Probabilities, RiskConfig};
+use bilore_ml_rs::risk::{risk_params, ModelQuality, Probabilities, RiskConfig, RiskParams};
 use bilore_ml_rs::trade_setup::{trade_setup, ProfileLevels, SetupResult, TradeSetupConfig};
 use bilore_ml_rs::{db as ml_db, features};
 use bilore_ml_rs::live_state::{LiveModelState, LiveSetup};
@@ -72,7 +73,8 @@ struct OpenTrade {
 }
 
 /// One strategy's shadow-trade slot within a symbol's state: its currently
-/// tracked trade and its own one-trade-per-session lock. Two slots
+/// tracked trade and its own one-trade-per-session lock (released again if
+/// a still-pending trade is invalidated on a direction flip). Slots
 /// (`ml-model`, `fade-poc`) run fully independent of each other so neither
 /// strategy can suppress the other's signals — see
 /// `bilore-project-conf/contracts/strategies.md`.
@@ -95,6 +97,26 @@ struct StrategySlot {
     /// reason gets logged now; the NATS publish itself is untouched — still
     /// fires every tick, since the cockpit just wants the freshest state.
     last_logged_reason: Option<String>,
+}
+
+impl StrategySlot {
+    /// Cancels a still-`Pending` trade whose strategy direction has flipped
+    /// (`shadow_trader::invalidate_on_direction_flip`, 2026-09-25) and
+    /// re-arms the slot: the setup never filled, so it must not burn the
+    /// session's one-trade lock — the strategy may lock a fresh setup on
+    /// its next evaluation. Returns the invalidated trade for persistence/
+    /// alerting; `None` (slot untouched) when nothing was pending or the
+    /// direction still holds. An `Entered` trade is never touched.
+    fn invalidate_on_direction_flip(&mut self, current: Direction) -> Option<OpenTrade> {
+        let ot = self.open.as_mut()?;
+        if !shadow_trader::invalidate_on_direction_flip(&mut ot.trade, current) {
+            return None;
+        }
+        self.locked_today = false;
+        self.last_checked_price = None;
+        self.last_logged_reason = None;
+        self.open.take()
+    }
 }
 
 struct TrainedModel {
@@ -364,6 +386,8 @@ async fn main() -> Result<()> {
 
     let risk_cfg = RiskConfig::default();
     let setup_cfg = TradeSetupConfig::default();
+    let flip_buffer_ticks = flip_buffer_ticks(std::env::var("FADE_FLIP_BUFFER_TICKS").ok().as_deref());
+    tracing::info!("fade flip buffer: {flip_buffer_ticks} ticks past prior POC");
 
     let today_ct0 = Utc::now().with_timezone(&Chicago).date_naive();
     let mut states: HashMap<String, PerSymbolState> = HashMap::new();
@@ -478,6 +502,29 @@ async fn main() -> Result<()> {
                 state.last_tick_ts = tick.ts;
                 state.tpo.add_trade(tick.price, tick.size.max(0) as u64, tick.ts);
 
+                // Direction-flip invalidation (2026-09-25), before the fill
+                // check below so a flipped setup can't fill on this tick:
+                // both fade slots' direction is live price vs prior POC,
+                // with a flip buffer so chop at the POC doesn't cancel and
+                // re-lock every few ticks (fade::fade_flipped).
+                if let Some(prior) = state.prior {
+                    let buffer = flip_buffer_ticks * state.tick_size;
+                    let dir = fade::fade_direction(tick.price, prior.poc);
+                    for (slot, slug) in [(&mut state.fade, strategy::FADE_POC), (&mut state.fade_fill, strategy::FADE_POC_FILL)] {
+                        let Some(held) = slot.open.as_ref().map(|ot| ot.trade.direction) else { continue };
+                        if !fade::fade_flipped(held, tick.price, prior.poc, buffer) {
+                            continue;
+                        }
+                        if let Some(ot) = slot.invalidate_on_direction_flip(dir) {
+                            let why = format!(
+                                "price {} crossed prior POC {} by more than {flip_buffer_ticks} ticks — fade now {}",
+                                tick.price, prior.poc, dir_upper(dir)
+                            );
+                            report_invalidated(&pool, &http, &bot_token, &chat_id, symbol, slug, &ot, &why).await;
+                        }
+                    }
+                }
+
                 for (slot, slug) in [
                     (&mut state.ml, strategy::ML_MODEL),
                     (&mut state.fade, strategy::FADE_POC),
@@ -548,6 +595,16 @@ async fn main() -> Result<()> {
                         close: finished.close,
                     });
 
+                    // ml-model's direction only changes when a period closes
+                    // (its lean is predict()'s period-level read), so its
+                    // flip check lives here rather than per tick.
+                    if let Some(score) = score_ml(state, &risk_cfg) {
+                        if let Some(ot) = state.ml.invalidate_on_direction_flip(score.direction) {
+                            let why = format!("ml-model lean flipped to {} (period {})", dir_upper(score.direction), score.next_period_idx);
+                            report_invalidated(&pool, &http, &bot_token, &chat_id, symbol, strategy::ML_MODEL, &ot, &why).await;
+                        }
+                    }
+
                     if state.prior.is_some() && !state.ml.locked_today && state.ml.open.is_none() {
                         try_signal(
                             &pool, &http, &bot_token, &chat_id, nats.as_ref(), symbol,
@@ -602,6 +659,82 @@ fn build_live_input(
     }
 }
 
+/// ml-model's read for the NEXT period: probabilities, both sides'
+/// risk_params, and the lean (higher-confidence side, Long on a tie).
+/// Shared by `try_signal` and the period-close direction-flip check so the
+/// two can never disagree about which way ml-model leans. `None` past the
+/// 13-period RTH cap, before a prior session / completed period / any
+/// trade today exists.
+struct MlScore {
+    next_period_idx: usize,
+    prev: PeriodBar,
+    prior_levels: ProfileLevels,
+    probs: Probabilities,
+    r_long: RiskParams,
+    r_short: RiskParams,
+    direction: Direction,
+}
+
+fn score_ml(state: &PerSymbolState, risk_cfg: &RiskConfig) -> Option<MlScore> {
+    let prev = state.last_completed?;
+    let next_period_idx = prev.period_idx + 1;
+    if next_period_idx > 12 {
+        return None; // past the 13-period RTH cap (A-M)
+    }
+    let prior_levels = state.prior?;
+    // no trades recorded yet today — nothing to score against
+    let metrics = state.tpo.metrics_for_date(state.today_ct)?;
+
+    let input = build_live_input(state, &prior_levels, metrics.ib_high, metrics.ib_low, &prev);
+    let probs: Probabilities = predict(&state.trained.models, &state.trained.means, &state.trained.stds, &input);
+
+    let tick_value_f64 = state.tick_value.to_f64().unwrap_or(1.25);
+    let r_long = risk_params(Direction::Long, &probs, 1, &state.trained.quality, risk_cfg, tick_value_f64);
+    let r_short = risk_params(Direction::Short, &probs, 1, &state.trained.quality, risk_cfg, tick_value_f64);
+    let direction = if r_long.confidence >= r_short.confidence { Direction::Long } else { Direction::Short };
+    Some(MlScore { next_period_idx, prev, prior_levels, probs, r_long, r_short, direction })
+}
+
+/// `FADE_FLIP_BUFFER_TICKS` — how many ticks past the prior POC price must
+/// go before a pending fade setup counts as flipped (`fade::fade_flipped`).
+/// Default 4 (1 point on MES/MNQ); unparseable or negative → default.
+fn flip_buffer_ticks(env: Option<&str>) -> Decimal {
+    env.and_then(|v| v.trim().parse::<Decimal>().ok()).filter(|t| !t.is_sign_negative()).unwrap_or(Decimal::from(4))
+}
+
+fn dir_upper(d: Direction) -> &'static str {
+    match d {
+        Direction::Long => "LONG",
+        Direction::Short => "SHORT",
+    }
+}
+
+/// Persist + alert a pending setup cancelled by
+/// `StrategySlot::invalidate_on_direction_flip`. The cockpit needs nothing
+/// extra: the re-armed strategy publishes a fresh `LiveModelState` on its
+/// next evaluation, replacing the stale locked one.
+#[allow(clippy::too_many_arguments)]
+async fn report_invalidated(
+    pool: &PgPool,
+    http: &reqwest::Client,
+    bot_token: &str,
+    chat_id: &str,
+    symbol: &str,
+    strategy_label: &str,
+    ot: &OpenTrade,
+    why: &str,
+) {
+    tracing::info!("{symbol} INVALIDATED [{strategy_label}] pending {:?} @ {}: {why}", ot.trade.direction, ot.trade.entry_lo);
+    if let Err(e) = db::update_shadow_trade_v2(pool, ot.db_id, &ot.trade).await {
+        tracing::error!("{symbol}: update_shadow_trade_v2 (invalidated) failed: {e}");
+    }
+    if let Err(e) = db::set_shadow_trade_v2_notes(pool, ot.db_id, why).await {
+        tracing::error!("{symbol}: set_shadow_trade_v2_notes failed: {e}");
+    }
+    sound::play(sound::AlertKind::Expired);
+    notify(http, bot_token, chat_id, &telegram::invalidated_message(symbol, strategy_label, &ot.trade, why)).await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn try_signal(
     pool: &PgPool,
@@ -614,33 +747,15 @@ async fn try_signal(
     setup_cfg: &TradeSetupConfig,
     state: &mut PerSymbolState,
 ) {
-    let Some(prev) = state.last_completed else { return };
-    let next_period_idx = prev.period_idx + 1;
-    if next_period_idx > 12 {
-        return; // past the 13-period RTH cap (A-M)
-    }
-
-    let Some(prior_levels) = state.prior else { return };
-
-    let metrics = state.tpo.metrics_for_date(state.today_ct);
-    let (ib_high, ib_low) = match &metrics {
-        Some(m) => (m.ib_high, m.ib_low),
-        None => return, // no trades recorded yet today — nothing to score against
+    let Some(MlScore { next_period_idx, prev, prior_levels, probs, r_long, r_short, direction }) = score_ml(state, risk_cfg)
+    else {
+        return;
     };
-
-    let input = build_live_input(state, &prior_levels, ib_high, ib_low, &prev);
-
-    let probs: Probabilities = predict(&state.trained.models, &state.trained.means, &state.trained.stds, &input);
     tracing::debug!(
         "{symbol} period {next_period_idx} probs: bullish={:.3} break_vah={:.3} break_val={:.3} return_poc={:.3}",
         probs.p_bullish, probs.p_break_vah, probs.p_break_val, probs.p_return_poc
     );
-
-    let tick_value_f64 = state.tick_value.to_f64().unwrap_or(1.25);
-    let r_long = risk_params(Direction::Long, &probs, 1, &state.trained.quality, risk_cfg, tick_value_f64);
-    let r_short = risk_params(Direction::Short, &probs, 1, &state.trained.quality, risk_cfg, tick_value_f64);
-    let (direction, lean_risk) =
-        if r_long.confidence >= r_short.confidence { (Direction::Long, r_long.clone()) } else { (Direction::Short, r_short.clone()) };
+    let lean_risk = if direction == Direction::Long { r_long.clone() } else { r_short.clone() };
 
     let result = trade_setup(direction, prev.close, &prior_levels, &lean_risk, None, setup_cfg);
 
@@ -986,5 +1101,68 @@ async fn notify(http: &reqwest::Client, bot_token: &str, chat_id: &str, text: &s
     }
     if let Err(e) = telegram::send(http, bot_token, chat_id, text).await {
         tracing::error!("telegram send failed: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending_short_slot() -> StrategySlot {
+        let d = |s: &str| s.parse::<Decimal>().unwrap();
+        let trade = ShadowTrade::new(Direction::Short, d("5812.25"), d("5812.25"), d("5822.25"), Some(d("5792.25")), 1, true);
+        StrategySlot {
+            open: Some(OpenTrade { db_id: 7, trade, trust: 0.7 }),
+            locked_today: true,
+            last_checked_price: Some(d("5810.00")),
+            last_logged_reason: Some("old".into()),
+        }
+    }
+
+    #[test]
+    fn a_direction_flip_hands_back_the_invalidated_trade_and_re_arms_the_slot() {
+        let mut slot = pending_short_slot();
+        let ot = slot.invalidate_on_direction_flip(Direction::Long).expect("should invalidate");
+        assert_eq!(ot.db_id, 7);
+        assert_eq!(ot.trade.outcome, Outcome::Invalidated);
+        assert!(slot.open.is_none());
+        assert!(!slot.locked_today, "an unfilled, invalidated setup must not burn the session's lock");
+        assert_eq!(slot.last_checked_price, None);
+        assert_eq!(slot.last_logged_reason, None);
+    }
+
+    #[test]
+    fn the_same_direction_leaves_the_slot_untouched() {
+        let mut slot = pending_short_slot();
+        assert!(slot.invalidate_on_direction_flip(Direction::Short).is_none());
+        assert!(slot.open.is_some());
+        assert!(slot.locked_today);
+    }
+
+    #[test]
+    fn an_entered_trade_keeps_the_slot_locked_on_a_flip() {
+        let mut slot = pending_short_slot();
+        let ot = slot.open.as_mut().unwrap();
+        ot.trade.outcome = Outcome::Entered;
+        ot.trade.entry_price = ot.trade.entry_lo.into();
+        assert!(slot.invalidate_on_direction_flip(Direction::Long).is_none());
+        assert_eq!(slot.open.as_ref().unwrap().trade.outcome, Outcome::Entered);
+        assert!(slot.locked_today);
+    }
+
+    #[test]
+    fn an_empty_slot_has_nothing_to_invalidate() {
+        let mut slot = StrategySlot::default();
+        assert!(slot.invalidate_on_direction_flip(Direction::Long).is_none());
+        assert!(!slot.locked_today);
+    }
+
+    #[test]
+    fn flip_buffer_ticks_defaults_to_4_and_rejects_bad_values() {
+        assert_eq!(flip_buffer_ticks(None), Decimal::from(4));
+        assert_eq!(flip_buffer_ticks(Some("8")), Decimal::from(8));
+        assert_eq!(flip_buffer_ticks(Some("0")), Decimal::ZERO);
+        assert_eq!(flip_buffer_ticks(Some("abc")), Decimal::from(4));
+        assert_eq!(flip_buffer_ticks(Some("-2")), Decimal::from(4));
     }
 }
