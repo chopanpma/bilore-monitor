@@ -13,6 +13,7 @@ via `git config core.hooksPath .githooks`). `db.rs` (DB I/O) and `main.rs`
 | `telegram.rs` | done | [telegram.md](telegram.md) |
 | `sound.rs` | done | [sound.md](sound.md) |
 | `economics.rs` | done (2026-09-22 — per-symbol tick economics) | [economics.md](economics.md) |
+| `daily_summary.rs` | done (2026-09-28 — end-of-day Telegram summary) | [daily_summary.md](daily_summary.md) |
 | `db.rs` | exempt (I/O) | — |
 | `main.rs` | exempt (wiring) | — |
 

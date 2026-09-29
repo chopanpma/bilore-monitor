@@ -1,3 +1,4 @@
+pub mod daily_summary;
 pub mod db;
 pub mod economics;
 pub mod live_signal;

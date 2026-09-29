@@ -51,7 +51,8 @@ use bilore_ml_rs::{db as ml_db, features};
 use bilore_ml_rs::live_state::{LiveModelState, LiveSetup};
 use bilore_core::fade;
 use bilore_monitor::period_agg::{PeriodAggregator, PeriodBar};
-use bilore_monitor::{db, sound, telegram};
+use bilore_backtest::gate;
+use bilore_monitor::{daily_summary, db, sound, telegram};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use chrono_tz::America::Chicago;
 use ndarray::Array1;
@@ -417,6 +418,8 @@ async fn main() -> Result<()> {
     );
 
     let mut last_pending_retry = Utc::now();
+    // In-memory only: a restart inside the 15:00–16:00 CT window re-sends.
+    let mut last_summary: Option<NaiveDate> = None;
     let mut tick_interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         tick_interval.tick().await;
@@ -436,6 +439,11 @@ async fn main() -> Result<()> {
                 }
             }
             pending = still_pending;
+        }
+
+        if let Some(day) = daily_summary::summary_due(Utc::now(), last_summary) {
+            last_summary = Some(day);
+            send_daily_summary(&pool, &http, &bot_token, &chat_id, day).await;
         }
 
         for (symbol, state) in states.iter_mut() {
@@ -707,6 +715,22 @@ fn dir_upper(d: Direction) -> &'static str {
         Direction::Long => "LONG",
         Direction::Short => "SHORT",
     }
+}
+
+/// End-of-day Telegram summary (`bilore_monitor::daily_summary`): today's
+/// trades per strategy + the cumulative go-live gate. A DB error skips
+/// today's summary (logged) rather than sending a wrong one.
+async fn send_daily_summary(pool: &PgPool, http: &reqwest::Client, bot_token: &str, chat_id: &str, day: NaiveDate) {
+    const STRATEGIES: [&str; 3] = [strategy::ML_MODEL, strategy::FADE_POC, strategy::FADE_POC_FILL];
+    let (today, resolved) = match (db::fetch_day_rows(pool, day).await, db::fetch_resolved_gate_rows(pool).await) {
+        (Ok(t), Ok(r)) => (t, r),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::error!("daily summary for {day} skipped — DB read failed: {e}");
+            return;
+        }
+    };
+    let gates = gate::compute_gates(&gate::group_by_strategy(&resolved), &STRATEGIES, &gate::TRUST_CFG);
+    notify(http, bot_token, chat_id, &daily_summary::summary_message(day, &STRATEGIES, &today, &gates, &gate::TRUST_CFG)).await;
 }
 
 /// Persist + alert a pending setup cancelled by

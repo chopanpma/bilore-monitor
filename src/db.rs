@@ -146,3 +146,52 @@ pub async fn set_shadow_trade_v2_notes(pool: &PgPool, id: i64, notes: &str) -> R
         .await?;
     Ok(())
 }
+
+#[derive(Debug, sqlx::FromRow)]
+struct SummaryRow {
+    strategy: String,
+    outcome: String,
+    pnl_ticks: Option<f64>,
+    pnl_dollars: Option<f64>,
+}
+
+/// Every `shadow_trades_v2` row for one CT session date — feeds the daily
+/// Telegram summary's "Today" lines (`daily_summary::summary_message`).
+pub async fn fetch_day_rows(pool: &PgPool, date: NaiveDate) -> Result<Vec<crate::daily_summary::TodayRow>> {
+    let rows: Vec<SummaryRow> = sqlx::query_as(
+        "SELECT strategy, outcome, pnl_ticks::float8 AS pnl_ticks, pnl_dollars::float8 AS pnl_dollars \
+         FROM shadow_trades_v2 WHERE session_date = $1",
+    )
+    .bind(date)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| crate::daily_summary::TodayRow {
+            strategy: r.strategy,
+            outcome: r.outcome,
+            pnl_ticks: r.pnl_ticks,
+            pnl_dollars: r.pnl_dollars,
+        })
+        .collect())
+}
+
+/// All resolved (`won`/`lost`) rows — same query as `bilore-backtest-gate`,
+/// so the summary's cumulative gate line matches that report exactly.
+pub async fn fetch_resolved_gate_rows(pool: &PgPool) -> Result<Vec<bilore_backtest::gate::GateRow>> {
+    let rows: Vec<SummaryRow> = sqlx::query_as(
+        "SELECT strategy, outcome, pnl_ticks::float8 AS pnl_ticks, pnl_dollars::float8 AS pnl_dollars \
+         FROM shadow_trades_v2 WHERE outcome IN ('won', 'lost')",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| bilore_backtest::gate::GateRow {
+            strategy: r.strategy,
+            outcome: r.outcome,
+            pnl_ticks: r.pnl_ticks,
+            pnl_dollars: r.pnl_dollars,
+        })
+        .collect())
+}
