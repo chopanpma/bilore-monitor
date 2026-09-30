@@ -2,7 +2,7 @@
 
 Source: `src/daily_summary.rs` · New 2026-09-28 (user request). Wired in
 `main.rs` (`send_daily_summary`, checked every loop tick); DB reads in
-`db.rs` (`fetch_day_rows`, `fetch_resolved_gate_rows`).
+`db.rs` (`fetch_summary_rows`, `fetch_resolved_gate_rows`).
 
 ## When
 
@@ -20,23 +20,29 @@ flowchart TD
 ## What
 
 ```
-📊 [V2] DAILY SUMMARY — 2026-09-28
+📊 [V2] DAILY SUMMARY — 2026-09-29 · MES
 
 ml-model
-Today : 4 — ✅1 ❌1 ⏱0 🚫1 open 1 · +16.0t $+20.00
-Total : 3 (1W/2L) 33% · exp -0.0t · $+0.00 · need 17 more · ❌ not live
+Today : 1 — ✅1 ❌0 ⏱0 🚫0 open 0 · 100% · +51.0t $+63.75
+Week  : 1 — ✅1 ❌0 ⏱0 🚫0 open 0 · 100% · +51.0t $+63.75
+Total : 5 (1W/4L) 20% · exp -2.6t · $-16.25 · need 15 more · ❌ not live
 …one block per strategy (ml-model, fade-poc, fade-poc-fill)…
 
 Gate: 20+ trades, win ≥ 35%, exp ≥ 5.0t, P&L ≥ $100
 ```
+(real output, 2026-09-29)
 
-- **Today**: every `shadow_trades_v2` row with that `session_date` —
-  won / lost / expired / invalidated / open (pending+entered); P&L sums
-  resolved rows only. All symbols together (dollars already per-symbol).
+- **Scope**: only contracts of the roots this process trades — `SYMBOLS`
+  mapped through `bilore_core::instrument::futures_root` (MES only since
+  2026-09-29). Old MNQ rows stay in the DB, just not counted.
+- **Today / Week**: rows with that `session_date` / Monday..today
+  (`week_start`) — won / lost / expired / invalidated / open
+  (pending+entered), win rate over won+lost (`–` if none), P&L of
+  resolved rows only. One DB read (`db::fetch_summary_rows`) feeds both.
 - **Total**: cumulative won/lost via `bilore_backtest::gate`
-  (`group_by_strategy` + `compute_gates` + `TRUST_CFG`) — the exact code
-  behind `bilore-backtest-gate`, so both always agree. `needed == 0` but
-  still failing → "❌ not live — below the bar".
+  (`group_by_strategy` + `compute_gates` + `TRUST_CFG`), same MES scope as
+  `bilore-backtest-gate`'s default `GATE_ROOTS`, so both always agree.
+  `needed == 0` but still failing → "❌ not live — below the bar".
 
 ## Notes
 

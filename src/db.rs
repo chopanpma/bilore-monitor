@@ -149,25 +149,37 @@ pub async fn set_shadow_trade_v2_notes(pool: &PgPool, id: i64, notes: &str) -> R
 
 #[derive(Debug, sqlx::FromRow)]
 struct SummaryRow {
+    session_date: NaiveDate,
+    symbol: String,
     strategy: String,
     outcome: String,
     pnl_ticks: Option<f64>,
     pnl_dollars: Option<f64>,
 }
 
-/// Every `shadow_trades_v2` row for one CT session date — feeds the daily
-/// Telegram summary's "Today" lines (`daily_summary::summary_message`).
-pub async fn fetch_day_rows(pool: &PgPool, date: NaiveDate) -> Result<Vec<crate::daily_summary::TodayRow>> {
-    let rows: Vec<SummaryRow> = sqlx::query_as(
-        "SELECT strategy, outcome, pnl_ticks::float8 AS pnl_ticks, pnl_dollars::float8 AS pnl_dollars \
-         FROM shadow_trades_v2 WHERE session_date = $1",
-    )
-    .bind(date)
-    .fetch_all(pool)
-    .await?;
+const SUMMARY_COLS: &str =
+    "session_date, symbol, strategy, outcome, pnl_ticks::float8 AS pnl_ticks, pnl_dollars::float8 AS pnl_dollars";
+
+/// `shadow_trades_v2` rows with `from <= session_date <= to`, only for
+/// contracts of `roots` (`bilore_core::instrument::in_roots`) — feeds the
+/// daily summary's Today/Week lines (`daily_summary::summary_message`).
+pub async fn fetch_summary_rows(
+    pool: &PgPool,
+    from: NaiveDate,
+    to: NaiveDate,
+    roots: &[&str],
+) -> Result<Vec<crate::daily_summary::DayRow>> {
+    let rows: Vec<SummaryRow> =
+        sqlx::query_as(&format!("SELECT {SUMMARY_COLS} FROM shadow_trades_v2 WHERE session_date BETWEEN $1 AND $2"))
+            .bind(from)
+            .bind(to)
+            .fetch_all(pool)
+            .await?;
     Ok(rows
         .into_iter()
-        .map(|r| crate::daily_summary::TodayRow {
+        .filter(|r| bilore_core::instrument::in_roots(&r.symbol, roots))
+        .map(|r| crate::daily_summary::DayRow {
+            session_date: r.session_date,
             strategy: r.strategy,
             outcome: r.outcome,
             pnl_ticks: r.pnl_ticks,
@@ -176,17 +188,17 @@ pub async fn fetch_day_rows(pool: &PgPool, date: NaiveDate) -> Result<Vec<crate:
         .collect())
 }
 
-/// All resolved (`won`/`lost`) rows — same query as `bilore-backtest-gate`,
-/// so the summary's cumulative gate line matches that report exactly.
-pub async fn fetch_resolved_gate_rows(pool: &PgPool) -> Result<Vec<bilore_backtest::gate::GateRow>> {
-    let rows: Vec<SummaryRow> = sqlx::query_as(
-        "SELECT strategy, outcome, pnl_ticks::float8 AS pnl_ticks, pnl_dollars::float8 AS pnl_dollars \
-         FROM shadow_trades_v2 WHERE outcome IN ('won', 'lost')",
-    )
-    .fetch_all(pool)
-    .await?;
+/// All resolved (`won`/`lost`) rows for contracts of `roots` — same scope
+/// as `bilore-backtest-gate`'s default (`GATE_ROOTS`, MES), so the
+/// summary's cumulative gate line matches that report.
+pub async fn fetch_resolved_gate_rows(pool: &PgPool, roots: &[&str]) -> Result<Vec<bilore_backtest::gate::GateRow>> {
+    let rows: Vec<SummaryRow> =
+        sqlx::query_as(&format!("SELECT {SUMMARY_COLS} FROM shadow_trades_v2 WHERE outcome IN ('won', 'lost')"))
+            .fetch_all(pool)
+            .await?;
     Ok(rows
         .into_iter()
+        .filter(|r| bilore_core::instrument::in_roots(&r.symbol, roots))
         .map(|r| bilore_backtest::gate::GateRow {
             strategy: r.strategy,
             outcome: r.outcome,
@@ -194,4 +206,38 @@ pub async fn fetch_resolved_gate_rows(pool: &PgPool) -> Result<Vec<bilore_backte
             pnl_dollars: r.pnl_dollars,
         })
         .collect())
+}
+
+/// An open (`pending`/`entered`) `shadow_trades_v2` row — restored into its
+/// strategy slot on startup so a restart continues the trade instead of
+/// duplicating it (`main.rs` `restore_open_trade`/`restore_slots`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct OpenTradeRow {
+    pub id: i32,
+    pub strategy: String,
+    pub direction: String,
+    pub entry_lo: f64,
+    pub entry_hi: f64,
+    pub stop: f64,
+    pub target_1: Option<f64>,
+    pub entry_price: Option<f64>,
+    pub outcome: String,
+    pub confidence: Option<f64>,
+    pub signal_at: DateTime<Utc>,
+}
+
+/// Today's open trades for one symbol, newest first.
+pub async fn fetch_open_trades(pool: &PgPool, date: NaiveDate, symbol: &str) -> Result<Vec<OpenTradeRow>> {
+    Ok(sqlx::query_as(
+        "SELECT id, strategy, direction, entry_lo::float8 AS entry_lo, entry_hi::float8 AS entry_hi, \
+                stop::float8 AS stop, target_1::float8 AS target_1, entry_price::float8 AS entry_price, \
+                outcome, confidence::float8 AS confidence, signal_at \
+         FROM shadow_trades_v2 \
+         WHERE session_date = $1 AND symbol = $2 AND outcome IN ('pending', 'entered') \
+         ORDER BY signal_at DESC",
+    )
+    .bind(date)
+    .bind(symbol)
+    .fetch_all(pool)
+    .await?)
 }

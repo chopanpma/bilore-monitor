@@ -13,9 +13,9 @@
 //! **Two strategies per symbol, independent (2026-09-18):** the original ML
 //! pipeline (`ml-model`) plus the fade-toward-POC rule (`fade-poc`,
 //! model-analysis.md §6.10's live lead — see `fade.rs`). Each has its own
-//! open-trade slot and one-trade-per-session lock, so neither suppresses
-//! the other's signals (a setup cancelled before it fills — see
-//! `StrategySlot::invalidate_on_direction_flip` — releases that lock); every `shadow_trades_v2` row and Telegram alert
+//! open-trade slot (one open trade at a time, re-armed as soon as it
+//! resolves — no per-day lock since 2026-09-29), so neither suppresses
+//! the other's signals; every `shadow_trades_v2` row and Telegram alert
 //! carries its strategy label (`bilore_core::strategy`,
 //! contracts/strategies.md).
 //!
@@ -71,18 +71,79 @@ struct OpenTrade {
     /// to `shadow_trades_v2.confidence`, echoed back in the result
     /// Telegram message (contracts/strategies.md, "Trust metric").
     trust: f64,
+    /// When the trade was created (`signal_at`). Only ticks at/after this
+    /// may move it — startup replays ~12h of ticks, and a restored trade
+    /// must not get stopped out by prices from before it existed.
+    since: DateTime<Utc>,
+}
+
+impl OpenTrade {
+    fn sees(&self, tick_ts: DateTime<Utc>) -> bool {
+        tick_ts >= self.since
+    }
+}
+
+/// Whether a tick may generate a NEW setup: only live ticks, never the
+/// startup replay (ticks before `live_from`). The replay only rebuilds
+/// TPO/period/swing state — running signal logic over it re-created that
+/// day's trades as duplicate rows on every restart (09-22's triple).
+fn may_signal(tick_ts: DateTime<Utc>, live_from: DateTime<Utc>) -> bool {
+    tick_ts >= live_from
+}
+
+/// A DB row back into an `OpenTrade` (restart restore). `None` for
+/// resolved outcomes or malformed rows.
+fn restore_open_trade(row: &db::OpenTradeRow) -> Option<OpenTrade> {
+    use rust_decimal::prelude::FromPrimitive;
+    let dec = |v: f64| Decimal::from_f64(v).map(|d| d.round_dp(2));
+    let direction = match row.direction.as_str() {
+        "Long" => Direction::Long,
+        "Short" => Direction::Short,
+        _ => return None,
+    };
+    let target = match row.target_1 {
+        Some(t) => Some(dec(t)?),
+        None => None,
+    };
+    let mut trade = ShadowTrade::new(direction, dec(row.entry_lo)?, dec(row.entry_hi)?, dec(row.stop)?, target, 1, true);
+    match row.outcome.as_str() {
+        "pending" => {}
+        "entered" => {
+            trade.outcome = Outcome::Entered;
+            trade.entry_price = Some(dec(row.entry_price?)?);
+        }
+        _ => return None,
+    }
+    Some(OpenTrade { db_id: row.id as i64, trade, trust: row.confidence.unwrap_or(0.0), since: row.signal_at })
+}
+
+/// Newest open trade per strategy (`rows` newest first). Older duplicates
+/// (pre-2026-09-29 restarts) are left alone and logged by the caller.
+fn restore_slots(rows: &[db::OpenTradeRow]) -> HashMap<String, OpenTrade> {
+    let mut out = HashMap::new();
+    for row in rows {
+        if out.contains_key(&row.strategy) {
+            continue;
+        }
+        if let Some(ot) = restore_open_trade(row) {
+            out.insert(row.strategy.clone(), ot);
+        }
+    }
+    out
 }
 
 /// One strategy's shadow-trade slot within a symbol's state: its currently
-/// tracked trade and its own one-trade-per-session lock (released again if
-/// a still-pending trade is invalidated on a direction flip). Slots
+/// open trade, at most one at a time. No per-day lock (removed 2026-09-29,
+/// user decision — it came from v1's PDT-era one-trade-per-session rule and
+/// futures are PDT-exempt): the slot re-arms as soon as its trade resolves
+/// (won/lost/expired — `take_resolved`) or is invalidated, and the strategy
+/// may take its next setup immediately, no daily cap. Slots
 /// (`ml-model`, `fade-poc`) run fully independent of each other so neither
 /// strategy can suppress the other's signals — see
 /// `bilore-project-conf/contracts/strategies.md`.
 #[derive(Default)]
 struct StrategySlot {
     open: Option<OpenTrade>,
-    locked_today: bool,
     /// `fade-poc` only (2026-09-23): dedup guard for the per-tick live
     /// trigger — skips redundant evaluation when a tick repeats the last
     /// price already checked. Resets for free on session rollover along
@@ -101,11 +162,31 @@ struct StrategySlot {
 }
 
 impl StrategySlot {
+    /// Free to take a new setup — no open trade.
+    fn is_armed(&self) -> bool {
+        self.open.is_none()
+    }
+
+    /// Hands back the slot's trade once it's resolved (won/lost/expired) and
+    /// re-arms the slot, resetting the per-tick dedup so the very next tick
+    /// is evaluated fresh. `None` (slot untouched) while pending/entered.
+    fn take_resolved(&mut self) -> Option<OpenTrade> {
+        let resolved = matches!(
+            self.open.as_ref()?.trade.outcome,
+            Outcome::Won | Outcome::Lost | Outcome::Expired
+        );
+        if !resolved {
+            return None;
+        }
+        self.last_checked_price = None;
+        self.last_logged_reason = None;
+        self.open.take()
+    }
+
     /// Cancels a still-`Pending` trade whose strategy direction has flipped
     /// (`shadow_trader::invalidate_on_direction_flip`, 2026-09-25) and
-    /// re-arms the slot: the setup never filled, so it must not burn the
-    /// session's one-trade lock — the strategy may lock a fresh setup on
-    /// its next evaluation. Returns the invalidated trade for persistence/
+    /// re-arms the slot — the strategy may lock a fresh setup on its next
+    /// evaluation. Returns the invalidated trade for persistence/
     /// alerting; `None` (slot untouched) when nothing was pending or the
     /// direction still holds. An `Entered` trade is never touched.
     fn invalidate_on_direction_flip(&mut self, current: Direction) -> Option<OpenTrade> {
@@ -113,7 +194,6 @@ impl StrategySlot {
         if !shadow_trader::invalidate_on_direction_flip(&mut ot.trade, current) {
             return None;
         }
-        self.locked_today = false;
         self.last_checked_price = None;
         self.last_logged_reason = None;
         self.open.take()
@@ -160,6 +240,9 @@ struct PerSymbolState {
     /// 2026-09-22). `tick_value` is also handed to `risk_params` as `f64`.
     tick_size: Decimal,
     tick_value: Decimal,
+    /// Process start: ticks before this are startup replay (state only, no
+    /// new setups — see `may_signal`).
+    live_from: DateTime<Utc>,
     /// `ml-model` slot — the ML pipeline's shadow trade (see `try_signal`).
     ml: StrategySlot,
     /// `fade-poc` slot — the fade-toward-POC rule's shadow trade, assuming
@@ -309,6 +392,18 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
     let prior_hilo = fetch_prior_hilo(pool, symbol, today_ct, bridge_from).await?;
     let start = Utc::now() - ChronoDuration::hours(12);
     let (tick_size, tick_value) = bilore_monitor::economics::tick_economics(symbol);
+    let open_rows = db::fetch_open_trades(pool, today_ct, symbol).await?;
+    let mut restored = restore_slots(&open_rows);
+    if open_rows.len() > restored.len() {
+        tracing::warn!("{symbol}: {} open rows today, restored {} (newest per strategy)", open_rows.len(), restored.len());
+    }
+    let mut slot = |slug: &str| StrategySlot { open: restored.remove(slug), ..StrategySlot::default() };
+    let (ml, fade, fade_fill) = (slot(strategy::ML_MODEL), slot(strategy::FADE_POC), slot(strategy::FADE_POC_FILL));
+    for (slug, s) in [(strategy::ML_MODEL, &ml), (strategy::FADE_POC, &fade), (strategy::FADE_POC_FILL, &fade_fill)] {
+        if let Some(ot) = &s.open {
+            tracing::info!("{symbol}: restored open [{slug}] trade #{} ({:?})", ot.db_id, ot.trade.outcome);
+        }
+    }
     Ok(PerSymbolState {
         trained,
         today_ct,
@@ -326,9 +421,10 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
         last_tick_ts: start,
         tick_size,
         tick_value,
-        ml: StrategySlot::default(),
-        fade: StrategySlot::default(),
-        fade_fill: StrategySlot::default(),
+        live_from: Utc::now(),
+        ml,
+        fade,
+        fade_fill,
     })
 }
 
@@ -420,6 +516,16 @@ async fn main() -> Result<()> {
     let mut last_pending_retry = Utc::now();
     // In-memory only: a restart inside the 15:00–16:00 CT window re-sends.
     let mut last_summary: Option<NaiveDate> = None;
+    // Summary scope = roots of the symbols this process trades (SYMBOLS),
+    // so it follows the MES-only decision (2026-09-29) automatically.
+    let summary_root_names: Vec<String> = {
+        let mut r: Vec<String> =
+            registered.iter().filter_map(|s| bilore_core::instrument::futures_root(s)).map(str::to_string).collect();
+        r.sort();
+        r.dedup();
+        r
+    };
+    let summary_roots: Vec<&str> = summary_root_names.iter().map(String::as_str).collect();
     let mut tick_interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         tick_interval.tick().await;
@@ -443,7 +549,7 @@ async fn main() -> Result<()> {
 
         if let Some(day) = daily_summary::summary_due(Utc::now(), last_summary) {
             last_summary = Some(day);
-            send_daily_summary(&pool, &http, &bot_token, &chat_id, day).await;
+            send_daily_summary(&pool, &http, &bot_token, &chat_id, day, &summary_roots).await;
         }
 
         for (symbol, state) in states.iter_mut() {
@@ -519,7 +625,7 @@ async fn main() -> Result<()> {
                     let buffer = flip_buffer_ticks * state.tick_size;
                     let dir = fade::fade_direction(tick.price, prior.poc);
                     for (slot, slug) in [(&mut state.fade, strategy::FADE_POC), (&mut state.fade_fill, strategy::FADE_POC_FILL)] {
-                        let Some(held) = slot.open.as_ref().map(|ot| ot.trade.direction) else { continue };
+                        let Some(held) = slot.open.as_ref().filter(|ot| ot.sees(tick.ts)).map(|ot| ot.trade.direction) else { continue };
                         if !fade::fade_flipped(held, tick.price, prior.poc, buffer) {
                             continue;
                         }
@@ -538,15 +644,22 @@ async fn main() -> Result<()> {
                     (&mut state.fade, strategy::FADE_POC),
                     (&mut state.fade_fill, strategy::FADE_POC_FILL),
                 ] {
-                    if let Some(ot) = slot.open.as_mut() {
-                        if shadow_trader::on_price(&mut ot.trade, tick.price, state.tick_size, state.tick_value).is_some()
-                            && matches!(ot.trade.outcome, Outcome::Won | Outcome::Lost)
-                        {
+                    if let Some(ot) = slot.open.as_mut().filter(|ot| ot.sees(tick.ts)) {
+                        if shadow_trader::on_price(&mut ot.trade, tick.price, state.tick_size, state.tick_value).is_some() {
+                            // Persist every transition, fills included — a
+                            // restart restores open trades from the DB
+                            // (restore_open_trade), so an Entered trade must
+                            // not read back as still Pending.
                             let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
-                            sound::play(if ot.trade.outcome == Outcome::Won { sound::AlertKind::Won } else { sound::AlertKind::Lost });
-                            notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, slug, &ot.trade, ot.trust)).await;
+                            if matches!(ot.trade.outcome, Outcome::Won | Outcome::Lost) {
+                                sound::play(if ot.trade.outcome == Outcome::Won { sound::AlertKind::Won } else { sound::AlertKind::Lost });
+                                notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, slug, &ot.trade, ot.trust)).await;
+                            }
                         }
                     }
+                    // Re-arm (2026-09-29): a resolved trade frees the slot
+                    // for the strategy's next setup — no one-per-day lock.
+                    slot.take_resolved();
                 }
 
                 // fade-poc / fade-poc-fill (2026-09-23): checked on every
@@ -563,10 +676,11 @@ async fn main() -> Result<()> {
                 // entry, fade-poc-fill waits for an actual fill (see
                 // strategy::FADE_POC_FILL's doc comment) — neither's
                 // lock/open state affects the other.
-                if state.prior.is_some()
+                let live = may_signal(tick.ts, state.live_from);
+                if live
+                    && state.prior.is_some()
                     && state.last_completed.is_some()
-                    && !state.fade.locked_today
-                    && state.fade.open.is_none()
+                    && state.fade.is_armed()
                     && state.fade.last_checked_price != Some(tick.price)
                 {
                     state.fade.last_checked_price = Some(tick.price);
@@ -576,10 +690,10 @@ async fn main() -> Result<()> {
                     )
                     .await;
                 }
-                if state.prior.is_some()
+                if live
+                    && state.prior.is_some()
                     && state.last_completed.is_some()
-                    && !state.fade_fill.locked_today
-                    && state.fade_fill.open.is_none()
+                    && state.fade_fill.is_armed()
                     && state.fade_fill.last_checked_price != Some(tick.price)
                 {
                     state.fade_fill.last_checked_price = Some(tick.price);
@@ -613,7 +727,7 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    if state.prior.is_some() && !state.ml.locked_today && state.ml.open.is_none() {
+                    if live && state.prior.is_some() && state.ml.is_armed() {
                         try_signal(
                             &pool, &http, &bot_token, &chat_id, nats.as_ref(), symbol,
                             &risk_cfg, &setup_cfg, state,
@@ -720,17 +834,27 @@ fn dir_upper(d: Direction) -> &'static str {
 /// End-of-day Telegram summary (`bilore_monitor::daily_summary`): today's
 /// trades per strategy + the cumulative go-live gate. A DB error skips
 /// today's summary (logged) rather than sending a wrong one.
-async fn send_daily_summary(pool: &PgPool, http: &reqwest::Client, bot_token: &str, chat_id: &str, day: NaiveDate) {
+async fn send_daily_summary(
+    pool: &PgPool,
+    http: &reqwest::Client,
+    bot_token: &str,
+    chat_id: &str,
+    day: NaiveDate,
+    roots: &[&str],
+) {
     const STRATEGIES: [&str; 3] = [strategy::ML_MODEL, strategy::FADE_POC, strategy::FADE_POC_FILL];
-    let (today, resolved) = match (db::fetch_day_rows(pool, day).await, db::fetch_resolved_gate_rows(pool).await) {
-        (Ok(t), Ok(r)) => (t, r),
+    let week = db::fetch_summary_rows(pool, daily_summary::week_start(day), day, roots).await;
+    let resolved = db::fetch_resolved_gate_rows(pool, roots).await;
+    let (week, resolved) = match (week, resolved) {
+        (Ok(w), Ok(r)) => (w, r),
         (Err(e), _) | (_, Err(e)) => {
             tracing::error!("daily summary for {day} skipped — DB read failed: {e}");
             return;
         }
     };
     let gates = gate::compute_gates(&gate::group_by_strategy(&resolved), &STRATEGIES, &gate::TRUST_CFG);
-    notify(http, bot_token, chat_id, &daily_summary::summary_message(day, &STRATEGIES, &today, &gates, &gate::TRUST_CFG)).await;
+    let msg = daily_summary::summary_message(day, &roots.join("+"), &STRATEGIES, &week, &gates, &gate::TRUST_CFG);
+    notify(http, bot_token, chat_id, &msg).await;
 }
 
 /// Persist + alert a pending setup cancelled by
@@ -855,10 +979,14 @@ async fn try_signal(
     trade.entry_price = Some(setup.entry_price);
 
     match db::insert_shadow_trade_v2(pool, state.today_ct, symbol, strategy::ML_MODEL, Some(lean_risk.confidence), &trade).await {
-        Ok(id) => state.ml.open = Some(OpenTrade { db_id: id, trade, trust: lean_risk.confidence }),
-        Err(e) => tracing::error!("{symbol}: insert_shadow_trade_v2 failed: {e}"),
+        Ok(id) => state.ml.open = Some(OpenTrade { db_id: id, trade, trust: lean_risk.confidence, since: Utc::now() }),
+        Err(e) => {
+            // No alert for a trade that isn't tracked — and with no daily
+            // lock, alerting anyway would re-send it on every evaluation.
+            tracing::error!("{symbol}: insert_shadow_trade_v2 failed, setup not tracked: {e}");
+            return;
+        }
     }
-    state.ml.locked_today = true;
 
     if let Some(nc) = nats {
         let state_msg = LiveModelState {
@@ -1066,10 +1194,13 @@ async fn try_fade_signal(
     // above already enters it on a real zone touch, no new logic needed.
 
     match db::insert_shadow_trade_v2(pool, state.today_ct, symbol, strategy_label, Some(trust), &trade).await {
-        Ok(id) => slot.open = Some(OpenTrade { db_id: id, trade, trust }),
-        Err(e) => tracing::error!("{symbol}: insert_shadow_trade_v2 ({strategy_label}) failed: {e}"),
+        Ok(id) => slot.open = Some(OpenTrade { db_id: id, trade, trust, since: Utc::now() }),
+        Err(e) => {
+            // Same as try_signal: never alert a setup that isn't tracked.
+            tracing::error!("{symbol}: insert_shadow_trade_v2 ({strategy_label}) failed, setup not tracked: {e}");
+            return;
+        }
     }
-    slot.locked_today = true;
 
     if let Some(nc) = nats {
         let state_msg = LiveModelState {
@@ -1136,8 +1267,7 @@ mod tests {
         let d = |s: &str| s.parse::<Decimal>().unwrap();
         let trade = ShadowTrade::new(Direction::Short, d("5812.25"), d("5812.25"), d("5822.25"), Some(d("5792.25")), 1, true);
         StrategySlot {
-            open: Some(OpenTrade { db_id: 7, trade, trust: 0.7 }),
-            locked_today: true,
+            open: Some(OpenTrade { db_id: 7, trade, trust: 0.7, since: DateTime::<Utc>::MIN_UTC }),
             last_checked_price: Some(d("5810.00")),
             last_logged_reason: Some("old".into()),
         }
@@ -1150,7 +1280,7 @@ mod tests {
         assert_eq!(ot.db_id, 7);
         assert_eq!(ot.trade.outcome, Outcome::Invalidated);
         assert!(slot.open.is_none());
-        assert!(!slot.locked_today, "an unfilled, invalidated setup must not burn the session's lock");
+        assert!(slot.is_armed(), "an unfilled, invalidated setup frees the slot for the next setup");
         assert_eq!(slot.last_checked_price, None);
         assert_eq!(slot.last_logged_reason, None);
     }
@@ -1160,7 +1290,7 @@ mod tests {
         let mut slot = pending_short_slot();
         assert!(slot.invalidate_on_direction_flip(Direction::Short).is_none());
         assert!(slot.open.is_some());
-        assert!(slot.locked_today);
+        assert!(!slot.is_armed());
     }
 
     #[test]
@@ -1171,14 +1301,14 @@ mod tests {
         ot.trade.entry_price = ot.trade.entry_lo.into();
         assert!(slot.invalidate_on_direction_flip(Direction::Long).is_none());
         assert_eq!(slot.open.as_ref().unwrap().trade.outcome, Outcome::Entered);
-        assert!(slot.locked_today);
+        assert!(!slot.is_armed());
     }
 
     #[test]
     fn an_empty_slot_has_nothing_to_invalidate() {
         let mut slot = StrategySlot::default();
         assert!(slot.invalidate_on_direction_flip(Direction::Long).is_none());
-        assert!(!slot.locked_today);
+        assert!(slot.is_armed());
     }
 
     #[test]
@@ -1188,5 +1318,126 @@ mod tests {
         assert_eq!(flip_buffer_ticks(Some("0")), Decimal::ZERO);
         assert_eq!(flip_buffer_ticks(Some("abc")), Decimal::from(4));
         assert_eq!(flip_buffer_ticks(Some("-2")), Decimal::from(4));
+    }
+
+    // ---- re-arm after resolution (2026-09-29: no more one-trade-per-day) ----
+
+    fn resolved(outcome: Outcome) -> StrategySlot {
+        let mut slot = pending_short_slot();
+        let ot = slot.open.as_mut().unwrap();
+        ot.trade.outcome = outcome;
+        slot
+    }
+
+    #[test]
+    fn a_won_trade_frees_the_slot_for_the_next_setup() {
+        let mut slot = resolved(Outcome::Won);
+        let ot = slot.take_resolved().expect("resolved trade handed back");
+        assert_eq!(ot.trade.outcome, Outcome::Won);
+        assert!(slot.is_armed());
+        assert_eq!(slot.last_checked_price, None, "next tick must be evaluated fresh");
+        assert_eq!(slot.last_logged_reason, None);
+    }
+
+    #[test]
+    fn lost_and_expired_trades_free_the_slot_too() {
+        for outcome in [Outcome::Lost, Outcome::Expired] {
+            let mut slot = resolved(outcome);
+            assert!(slot.take_resolved().is_some());
+            assert!(slot.is_armed());
+        }
+    }
+
+    #[test]
+    fn an_open_trade_keeps_the_slot_busy() {
+        for outcome in [Outcome::Pending, Outcome::Entered] {
+            let mut slot = resolved(outcome);
+            assert!(slot.take_resolved().is_none());
+            assert!(!slot.is_armed(), "one open trade per strategy per symbol at a time");
+        }
+    }
+
+    #[test]
+    fn an_empty_slot_is_armed_and_has_nothing_to_take() {
+        let mut slot = StrategySlot::default();
+        assert!(slot.is_armed());
+        assert!(slot.take_resolved().is_none());
+    }
+
+    // ---- restore open trades on startup (restart must not duplicate) ----
+
+    fn open_row(id: i32, strategy: &str, outcome: &str) -> db::OpenTradeRow {
+        db::OpenTradeRow {
+            id,
+            strategy: strategy.into(),
+            direction: "Short".into(),
+            entry_lo: 7747.75,
+            entry_hi: 7747.75,
+            stop: 7751.75,
+            target_1: Some(7735.0),
+            entry_price: if outcome == "entered" { Some(7747.75) } else { None },
+            outcome: outcome.into(),
+            confidence: Some(0.53),
+            signal_at: "2026-09-29T14:27:00Z".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn an_entered_row_restores_as_an_entered_trade_with_its_fill() {
+        let ot = restore_open_trade(&open_row(42, "fade-poc", "entered")).expect("restored");
+        let d = |s: &str| s.parse::<Decimal>().unwrap();
+        assert_eq!(ot.db_id, 42);
+        assert_eq!(ot.trade.outcome, Outcome::Entered);
+        assert_eq!(ot.trade.direction, Direction::Short);
+        assert_eq!(ot.trade.entry_price, Some(d("7747.75")));
+        assert_eq!(ot.trade.stop, d("7751.75"));
+        assert_eq!(ot.trade.target_1, Some(d("7735.00")));
+        assert!((ot.trust - 0.53).abs() < 1e-9);
+        assert_eq!(ot.since, "2026-09-29T14:27:00Z".parse::<DateTime<Utc>>().unwrap());
+    }
+
+    #[test]
+    fn a_pending_row_restores_as_pending_still_waiting_for_its_fill() {
+        let ot = restore_open_trade(&open_row(7, "fade-poc-fill", "pending")).expect("restored");
+        assert_eq!(ot.trade.outcome, Outcome::Pending);
+        assert_eq!(ot.trade.entry_price, None);
+    }
+
+    #[test]
+    fn resolved_or_malformed_rows_are_not_restored() {
+        assert!(restore_open_trade(&open_row(1, "ml-model", "won")).is_none());
+        let mut bad = open_row(2, "ml-model", "entered");
+        bad.direction = "Sideways".into();
+        assert!(restore_open_trade(&bad).is_none());
+    }
+
+    #[test]
+    fn only_the_newest_open_trade_per_strategy_is_restored() {
+        // rows arrive newest first (ORDER BY signal_at DESC)
+        let rows = vec![open_row(9, "ml-model", "entered"), open_row(5, "ml-model", "entered"), open_row(8, "fade-poc", "pending")];
+        let restored = restore_slots(&rows);
+        assert_eq!(restored.get("ml-model").map(|o| o.db_id), Some(9));
+        assert_eq!(restored.get("fade-poc").map(|o| o.db_id), Some(8));
+        assert_eq!(restored.len(), 2);
+    }
+
+    // ---- replay safety: startup replays ~12h of ticks ----
+
+    #[test]
+    fn a_trade_ignores_ticks_from_before_it_existed() {
+        let mut ot = restore_open_trade(&open_row(1, "fade-poc", "entered")).unwrap();
+        let before: DateTime<Utc> = "2026-09-29T14:00:00Z".parse().unwrap();
+        let after: DateTime<Utc> = "2026-09-29T14:30:00Z".parse().unwrap();
+        assert!(!ot.sees(before));
+        assert!(ot.sees(after));
+        ot.since = after;
+        assert!(ot.sees(after), "the tick at the signal instant itself counts");
+    }
+
+    #[test]
+    fn replayed_ticks_never_generate_setups() {
+        let live_from: DateTime<Utc> = "2026-09-29T15:00:00Z".parse().unwrap();
+        assert!(!may_signal("2026-09-29T14:59:59Z".parse().unwrap(), live_from));
+        assert!(may_signal("2026-09-29T15:00:00Z".parse().unwrap(), live_from));
     }
 }
