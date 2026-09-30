@@ -117,6 +117,24 @@ fn restore_open_trade(row: &db::OpenTradeRow) -> Option<OpenTrade> {
     Some(OpenTrade { db_id: row.id as i64, trade, trust: row.confidence.unwrap_or(0.0), since: row.signal_at })
 }
 
+/// Today's stopped-out `(direction, entry)` levels per strategy, from the
+/// DB (restart restore for `StrategySlot::stopped`). Malformed rows skipped.
+fn stopped_levels_by_strategy(rows: &[db::StoppedRow]) -> HashMap<String, Vec<(Direction, Decimal)>> {
+    use rust_decimal::prelude::FromPrimitive;
+    let mut out: HashMap<String, Vec<(Direction, Decimal)>> = HashMap::new();
+    for r in rows {
+        let dir = match r.direction.as_str() {
+            "Long" => Direction::Long,
+            "Short" => Direction::Short,
+            _ => continue,
+        };
+        if let Some(entry) = Decimal::from_f64(r.entry_lo).map(|d| d.round_dp(2)) {
+            out.entry(r.strategy.clone()).or_default().push((dir, entry));
+        }
+    }
+    out
+}
+
 /// Newest open trade per strategy (`rows` newest first). Older duplicates
 /// (pre-2026-09-29 restarts) are left alone and logged by the caller.
 fn restore_slots(rows: &[db::OpenTradeRow]) -> HashMap<String, OpenTrade> {
@@ -159,6 +177,13 @@ struct StrategySlot {
     /// reason gets logged now; the NATS publish itself is untouched — still
     /// fires every tick, since the cockpit just wants the freshest state.
     last_logged_reason: Option<String>,
+    /// `(direction, entry)` of every trade stopped out this session — that
+    /// level is not re-taken in the same direction (2026-09-30, user
+    /// decision; both backtests showed immediate re-entries into a level
+    /// that just failed as the main source of losses). The other direction
+    /// (a retest from the far side) stays allowed. Restored from the DB on
+    /// restart (`stopped_levels_by_strategy`), cleared on session rollover.
+    stopped: Vec<(Direction, Decimal)>,
 }
 
 impl StrategySlot {
@@ -180,7 +205,16 @@ impl StrategySlot {
         }
         self.last_checked_price = None;
         self.last_logged_reason = None;
-        self.open.take()
+        let ot = self.open.take()?;
+        if ot.trade.outcome == Outcome::Lost {
+            self.stopped.push((ot.trade.direction, ot.trade.entry_lo));
+        }
+        Some(ot)
+    }
+
+    /// A setup at a level this strategy was stopped out of today, same direction.
+    fn is_blocked(&self, direction: Direction, entry: Decimal) -> bool {
+        self.stopped.contains(&(direction, entry))
     }
 
     /// Cancels a still-`Pending` trade whose strategy direction has flipped
@@ -397,7 +431,12 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
     if open_rows.len() > restored.len() {
         tracing::warn!("{symbol}: {} open rows today, restored {} (newest per strategy)", open_rows.len(), restored.len());
     }
-    let mut slot = |slug: &str| StrategySlot { open: restored.remove(slug), ..StrategySlot::default() };
+    let mut stopped = stopped_levels_by_strategy(&db::fetch_stopped_levels(pool, today_ct, symbol).await?);
+    let mut slot = |slug: &str| StrategySlot {
+        open: restored.remove(slug),
+        stopped: stopped.remove(slug).unwrap_or_default(),
+        ..StrategySlot::default()
+    };
     let (ml, fade, fade_fill) = (slot(strategy::ML_MODEL), slot(strategy::FADE_POC), slot(strategy::FADE_POC_FILL));
     for (slug, s) in [(strategy::ML_MODEL, &ml), (strategy::FADE_POC, &fade), (strategy::FADE_POC_FILL, &fade_fill)] {
         if let Some(ot) = &s.open {
@@ -905,7 +944,12 @@ async fn try_signal(
     );
     let lean_risk = if direction == Direction::Long { r_long.clone() } else { r_short.clone() };
 
-    let result = trade_setup(direction, prev.close, &prior_levels, &lean_risk, None, setup_cfg);
+    let result = match trade_setup(direction, prev.close, &prior_levels, &lean_risk, None, setup_cfg) {
+        SetupResult::Setup(s) if state.ml.is_blocked(direction, s.entry_price) => {
+            SetupResult::NoSetup(format!("{direction:?} at {} was stopped out earlier today", s.entry_price))
+        }
+        r => r,
+    };
 
     // Publish the live MODEL/RISK/TRADE SETUP read regardless of outcome —
     // bilore-cockpit displays exactly this, whether or not it locks, same
@@ -1106,7 +1150,13 @@ async fn try_fade_signal(
     let direction = fade::fade_direction(live_price, prior_levels.poc);
     let lean_risk = if direction == Direction::Long { r_long.clone() } else { r_short.clone() };
 
-    let result = trade_setup(direction, live_price, &prior_levels, &lean_risk, None, setup_cfg);
+    let blocked_by = if assume_immediate_fill { &state.fade } else { &state.fade_fill };
+    let result = match trade_setup(direction, live_price, &prior_levels, &lean_risk, None, setup_cfg) {
+        SetupResult::Setup(s) if blocked_by.is_blocked(direction, s.entry_price) => {
+            SetupResult::NoSetup(format!("{direction:?} at {} was stopped out earlier today", s.entry_price))
+        }
+        r => r,
+    };
 
     // Publish the live state (strategy-tagged) regardless of outcome, same
     // contract as try_signal — the cockpit displays this.
@@ -1270,6 +1320,7 @@ mod tests {
             open: Some(OpenTrade { db_id: 7, trade, trust: 0.7, since: DateTime::<Utc>::MIN_UTC }),
             last_checked_price: Some(d("5810.00")),
             last_logged_reason: Some("old".into()),
+            stopped: Vec::new(),
         }
     }
 
@@ -1439,5 +1490,39 @@ mod tests {
         let live_from: DateTime<Utc> = "2026-09-29T15:00:00Z".parse().unwrap();
         assert!(!may_signal("2026-09-29T14:59:59Z".parse().unwrap(), live_from));
         assert!(may_signal("2026-09-29T15:00:00Z".parse().unwrap(), live_from));
+    }
+
+    // ---- no re-take of a level after a stop (2026-09-30) ----
+
+    #[test]
+    fn a_stopped_out_trade_blocks_the_same_direction_at_the_same_entry() {
+        let mut slot = resolved(Outcome::Lost);
+        slot.take_resolved();
+        let d = |s: &str| s.parse::<Decimal>().unwrap();
+        assert!(slot.is_blocked(Direction::Short, d("5812.25")), "same level, same direction");
+        assert!(!slot.is_blocked(Direction::Long, d("5812.25")), "a retest from the other side is a different trade");
+        assert!(!slot.is_blocked(Direction::Short, d("5815.00")), "another level is fine");
+    }
+
+    #[test]
+    fn a_winning_or_expired_trade_blocks_nothing() {
+        for outcome in [Outcome::Won, Outcome::Expired] {
+            let mut slot = resolved(outcome);
+            slot.take_resolved();
+            assert!(!slot.is_blocked(Direction::Short, "5812.25".parse().unwrap()));
+        }
+    }
+
+    #[test]
+    fn stopped_levels_restored_from_the_db_block_after_a_restart() {
+        let rows = vec![
+            db::StoppedRow { strategy: "fade-poc".into(), direction: "Short".into(), entry_lo: 7747.75 },
+            db::StoppedRow { strategy: "ml-model".into(), direction: "Long".into(), entry_lo: 7731.00 },
+            db::StoppedRow { strategy: "fade-poc".into(), direction: "Sideways".into(), entry_lo: 1.0 },
+        ];
+        let by = stopped_levels_by_strategy(&rows);
+        let d = |s: &str| s.parse::<Decimal>().unwrap();
+        assert_eq!(by.get("fade-poc"), Some(&vec![(Direction::Short, d("7747.75"))]));
+        assert_eq!(by.get("ml-model"), Some(&vec![(Direction::Long, d("7731.00"))]));
     }
 }

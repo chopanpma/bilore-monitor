@@ -241,3 +241,23 @@ pub async fn fetch_open_trades(pool: &PgPool, date: NaiveDate, symbol: &str) -> 
     .fetch_all(pool)
     .await?)
 }
+
+/// A trade stopped out today — its level is not re-taken in the same
+/// direction (`main.rs` `stopped_levels_by_strategy`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct StoppedRow {
+    pub strategy: String,
+    pub direction: String,
+    pub entry_lo: f64,
+}
+
+pub async fn fetch_stopped_levels(pool: &PgPool, date: NaiveDate, symbol: &str) -> Result<Vec<StoppedRow>> {
+    Ok(sqlx::query_as(
+        "SELECT strategy, direction, entry_lo::float8 AS entry_lo FROM shadow_trades_v2 \
+         WHERE session_date = $1 AND symbol = $2 AND outcome = 'lost'",
+    )
+    .bind(date)
+    .bind(symbol)
+    .fetch_all(pool)
+    .await?)
+}
