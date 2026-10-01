@@ -172,6 +172,7 @@ dependencies = [
  "anyhow",
  "bilore-core",
  "chrono",
+ "chrono-tz",
  "dotenvy",
  "ndarray",
  "rand 0.8.8",
