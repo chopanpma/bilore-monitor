@@ -52,7 +52,7 @@ use bilore_ml_rs::live_state::{LiveModelState, LiveSetup};
 use bilore_core::fade;
 use bilore_monitor::period_agg::{PeriodAggregator, PeriodBar};
 use bilore_backtest::gate;
-use bilore_monitor::{daily_summary, db, sound, telegram};
+use bilore_monitor::{daily_summary, db, globex, sound, telegram};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use chrono_tz::America::Chicago;
 use ndarray::Array1;
@@ -288,6 +288,16 @@ struct PerSymbolState {
     /// independent lock/open state, see `strategy::FADE_POC_FILL`'s doc
     /// comment for why this runs alongside `fade` rather than replacing it.
     fade_fill: StrategySlot,
+    /// `fade-poc-globex` slot (2026-09-30) — Globex-only fade with a wide
+    /// stop, see `bilore_monitor::globex`. Its session runs 17:00 -> 08:30
+    /// CT and is NOT reset by the CT-midnight rollover; a trade still open
+    /// when the session ends is closed at the mark (`close_at_mark`).
+    globex: StrategySlot,
+    /// Trading date of the Globex session `globex` belongs to (rows are
+    /// stored under it); `None` outside Globex.
+    globex_date: Option<NaiveDate>,
+    /// The just-finished RTH session's levels for that Globex session.
+    globex_prior: Option<ProfileLevels>,
 }
 
 /// Trains fresh from whatever `period_profiles`/`session_profiles`/
@@ -438,6 +448,29 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
         ..StrategySlot::default()
     };
     let (ml, fade, fade_fill) = (slot(strategy::ML_MODEL), slot(strategy::FADE_POC), slot(strategy::FADE_POC_FILL));
+
+    // fade-poc-globex rows live under their Globex session's trading date
+    // (the next trading day after 17:00), not necessarily today_ct.
+    let now_local = Utc::now().with_timezone(&Chicago).naive_local();
+    let in_globex = globex::globex_session(now_local);
+    let gdate = in_globex.unwrap_or(today_ct);
+    let mut g_open = restore_slots(&db::fetch_open_trades(pool, gdate, symbol).await?);
+    let mut g_stopped = stopped_levels_by_strategy(&db::fetch_stopped_levels(pool, gdate, symbol).await?);
+    let globex_slot = StrategySlot {
+        open: g_open.remove(strategy::FADE_POC_GLOBEX),
+        stopped: g_stopped.remove(strategy::FADE_POC_GLOBEX).unwrap_or_default(),
+        ..StrategySlot::default()
+    };
+    // Restored open trade outside Globex (down across 08:30): keep its date
+    // so the first live tick closes it at the mark.
+    let globex_date = if in_globex.is_some() || globex_slot.open.is_some() { Some(gdate) } else { None };
+    let globex_prior = match globex_date {
+        Some(d) => fetch_prior_session(pool, symbol, d, bridge_from).await?,
+        None => None,
+    };
+    if let Some(ot) = &globex_slot.open {
+        tracing::info!("{symbol}: restored open [{}] trade #{} ({:?})", strategy::FADE_POC_GLOBEX, ot.db_id, ot.trade.outcome);
+    }
     for (slug, s) in [(strategy::ML_MODEL, &ml), (strategy::FADE_POC, &fade), (strategy::FADE_POC_FILL, &fade_fill)] {
         if let Some(ot) = &s.open {
             tracing::info!("{symbol}: restored open [{slug}] trade #{} ({:?})", ot.db_id, ot.trade.outcome);
@@ -464,6 +497,9 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
         ml,
         fade,
         fade_fill,
+        globex: globex_slot,
+        globex_date,
+        globex_prior,
     })
 }
 
@@ -678,10 +714,56 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                // fade-poc-globex (2026-09-30), live ticks only — the startup
+                // replay must not open or close Globex sessions.
+                if may_signal(tick.ts, state.live_from) {
+                    let tick_ct = tick.ts.with_timezone(&Chicago).naive_local();
+                    let session = globex::globex_session(tick_ct);
+                    if session != state.globex_date {
+                        // Globex session ended (08:30) or a new one began
+                        // (17:00): close anything still open at the mark.
+                        if let Some(mut ot) = state.globex.open.take() {
+                            if shadow_trader::close_at_mark(&mut ot.trade, tick.price, state.tick_size, state.tick_value) {
+                                let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
+                                sound::play(sound::AlertKind::Expired);
+                                notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, strategy::FADE_POC_GLOBEX, &ot.trade, ot.trust)).await;
+                            }
+                        }
+                        state.globex = StrategySlot::default();
+                        state.globex_date = session;
+                        state.globex_prior = match session {
+                            Some(d) => fetch_prior_session(&pool, symbol, d, bf.as_deref()).await.unwrap_or(None),
+                            None => None,
+                        };
+                        if let (Some(d), Some(p)) = (session, state.globex_prior) {
+                            tracing::info!("{symbol}: Globex session for {d} — fading toward RTH POC {} (VAH {}, VAL {})", p.poc, p.vah, p.val);
+                        }
+                    }
+                    if let (Some(gdate), Some(prior)) = (state.globex_date, state.globex_prior) {
+                        let buffer = flip_buffer_ticks * state.tick_size;
+                        let dir = fade::fade_direction(tick.price, prior.poc);
+                        let held = state.globex.open.as_ref().map(|ot| ot.trade.direction);
+                        if held.is_some_and(|h| fade::fade_flipped(h, tick.price, prior.poc, buffer)) {
+                            if let Some(ot) = state.globex.invalidate_on_direction_flip(dir) {
+                                let why = format!(
+                                    "price {} crossed RTH POC {} by more than {flip_buffer_ticks} ticks — fade now {}",
+                                    tick.price, prior.poc, dir_upper(dir)
+                                );
+                                report_invalidated(&pool, &http, &bot_token, &chat_id, symbol, strategy::FADE_POC_GLOBEX, &ot, &why).await;
+                            }
+                        }
+                        if state.globex.is_armed() && state.globex.last_checked_price != Some(tick.price) {
+                            state.globex.last_checked_price = Some(tick.price);
+                            try_globex_signal(&pool, &http, &bot_token, &chat_id, symbol, &setup_cfg, tick.price, gdate, prior, state).await;
+                        }
+                    }
+                }
+
                 for (slot, slug) in [
                     (&mut state.ml, strategy::ML_MODEL),
                     (&mut state.fade, strategy::FADE_POC),
                     (&mut state.fade_fill, strategy::FADE_POC_FILL),
+                    (&mut state.globex, strategy::FADE_POC_GLOBEX),
                 ] {
                     if let Some(ot) = slot.open.as_mut().filter(|ot| ot.sees(tick.ts)) {
                         if shadow_trader::on_price(&mut ot.trade, tick.price, state.tick_size, state.tick_value).is_some() {
@@ -881,7 +963,7 @@ async fn send_daily_summary(
     day: NaiveDate,
     roots: &[&str],
 ) {
-    const STRATEGIES: [&str; 3] = [strategy::ML_MODEL, strategy::FADE_POC, strategy::FADE_POC_FILL];
+    const STRATEGIES: [&str; 4] = [strategy::ML_MODEL, strategy::FADE_POC, strategy::FADE_POC_FILL, strategy::FADE_POC_GLOBEX];
     let week = db::fetch_summary_rows(pool, daily_summary::week_start(day), day, roots).await;
     let resolved = db::fetch_resolved_gate_rows(pool, roots).await;
     let (week, resolved) = match (week, resolved) {
@@ -893,6 +975,52 @@ async fn send_daily_summary(
     };
     let gates = gate::compute_gates(&gate::group_by_strategy(&resolved), &STRATEGIES, &gate::TRUST_CFG);
     let msg = daily_summary::summary_message(day, &roots.join("+"), &STRATEGIES, &week, &gates, &gate::TRUST_CFG);
+    notify(http, bot_token, chat_id, &msg).await;
+}
+
+/// Arm a `fade-poc-globex` setup at `price` (see `bilore_monitor::globex`):
+/// a Pending trade (fill required) stored under the Globex session's
+/// trading date, with a SETUP alert. Untracked setups are never alerted.
+#[allow(clippy::too_many_arguments)]
+async fn try_globex_signal(
+    pool: &PgPool,
+    http: &reqwest::Client,
+    bot_token: &str,
+    chat_id: &str,
+    symbol: &str,
+    setup_cfg: &TradeSetupConfig,
+    price: Decimal,
+    session_date: NaiveDate,
+    prior: ProfileLevels,
+    state: &mut PerSymbolState,
+) {
+    let setup = match globex::globex_setup(price, &prior, &state.globex.stopped, setup_cfg) {
+        Ok(s) => s,
+        Err(reason) => {
+            if state.globex.last_logged_reason.as_deref() != Some(reason.as_str()) {
+                tracing::debug!("{symbol}: no {} setup: {reason}", strategy::FADE_POC_GLOBEX);
+                state.globex.last_logged_reason = Some(reason);
+            }
+            return;
+        }
+    };
+    let trade = ShadowTrade::new(setup.direction, setup.entry, setup.entry, setup.stop, Some(setup.target), 1, true);
+    match db::insert_shadow_trade_v2(pool, session_date, symbol, strategy::FADE_POC_GLOBEX, None, &trade).await {
+        Ok(id) => state.globex.open = Some(OpenTrade { db_id: id, trade, trust: 0.0, since: Utc::now() }),
+        Err(e) => {
+            tracing::error!("{symbol}: insert_shadow_trade_v2 ({}) failed, setup not tracked: {e}", strategy::FADE_POC_GLOBEX);
+            return;
+        }
+    }
+    tracing::info!(
+        "{symbol} LOCKED [{}]: {:?} entry={} stop={} target={} (RTH POC={}, anchor {})",
+        strategy::FADE_POC_GLOBEX, setup.direction, setup.entry, setup.stop, setup.target, prior.poc, setup.anchor
+    );
+    sound::play(sound::AlertKind::Setup);
+    let msg = format!(
+        "🌙 <b>[V2][{}] SETUP — {symbol}</b>\nDirection : <b>{:?}</b>\nEntry     : <b>{:.2}</b> (waits for a fill)\nStop      : {:.2} (60 ticks)\nTarget    : {:.2} (2R)\nRTH POC   : {:.2} · anchor {}",
+        strategy::FADE_POC_GLOBEX, setup.direction, setup.entry, setup.stop, setup.target, prior.poc, setup.anchor
+    );
     notify(http, bot_token, chat_id, &msg).await;
 }
 
