@@ -52,7 +52,7 @@ use bilore_ml_rs::live_state::{LiveModelState, LiveSetup};
 use bilore_core::fade;
 use bilore_monitor::period_agg::{PeriodAggregator, PeriodBar};
 use bilore_backtest::gate;
-use bilore_monitor::{daily_summary, db, globex, sound, telegram};
+use bilore_monitor::{daily_summary, db, globex, levels, sound, telegram};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use chrono_tz::America::Chicago;
 use ndarray::Array1;
@@ -358,6 +358,16 @@ async fn fetch_prior_session(
     before: NaiveDate,
     bridge_from: Option<&str>,
 ) -> Result<Option<ProfileLevels>> {
+    // Prefer the profile built from the recorded ticks (2026-10-02): the
+    // session_profiles row can be an incomplete live upsert until the next
+    // morning's backfill — see bilore_monitor::levels.
+    if let Some((day, rows, first, last)) = db::last_rth_volume_profile(pool, symbol, before).await? {
+        if let Some(levels) = levels::rth_levels_from_ticks(&rows, first, last) {
+            tracing::info!("{symbol}: prior RTH {day} from ticks — POC {} VAH {} VAL {}", levels.poc, levels.vah, levels.val);
+            return Ok(Some(levels));
+        }
+        tracing::warn!("{symbol}: RTH {day} not fully recorded ({first}-{last}) — using session_profiles");
+    }
     async fn query(pool: &PgPool, symbol: &str, before: NaiveDate) -> Result<Option<(Decimal, Decimal, Decimal)>> {
         Ok(sqlx::query_as(
             "SELECT poc, vah, val FROM session_profiles WHERE symbol = $1 AND date < $2 ORDER BY date DESC LIMIT 1",

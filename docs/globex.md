@@ -34,3 +34,11 @@ flowchart TD
 - Not shown in the cockpit's Risk/Trade Setup panel (it lists the three RTH
   strategies); Telegram SETUP alerts carry a 🌙 and the daily summary
   includes it.
+
+## Prior levels (2026-10-02)
+
+`fetch_prior_session` now builds the prior RTH POC/VAH/VAL from that day's
+08:30-15:00 CT ticks (`db::last_rth_volume_profile` +
+`levels::rth_levels_from_ticks`), falling back to `session_profiles` only if
+the day isn't fully recorded — tpo-builder's live "RTH" row keeps absorbing
+trades until 19:00 CT (see `levels.rs`). Applies to all strategies.

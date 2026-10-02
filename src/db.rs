@@ -261,3 +261,46 @@ pub async fn fetch_stopped_levels(pool: &PgPool, date: NaiveDate, symbol: &str) 
     .fetch_all(pool)
     .await?)
 }
+
+/// RTH volume at price for the latest trading date before `before` that has
+/// RTH ticks for `symbol` (searching back a week), with that session's
+/// first/last tick times (CT) — feeds `levels::rth_levels_from_ticks`.
+pub async fn last_rth_volume_profile(
+    pool: &PgPool,
+    symbol: &str,
+    before: NaiveDate,
+) -> Result<Option<(NaiveDate, Vec<(Decimal, i64)>, chrono::NaiveTime, chrono::NaiveTime)>> {
+    let day: Option<NaiveDate> = sqlx::query_scalar(
+        "SELECT max((ts AT TIME ZONE 'America/Chicago')::date) FROM tick_trades \
+         WHERE symbol = $1 \
+           AND ts >= (($2::date - 7)::timestamp AT TIME ZONE 'America/Chicago') \
+           AND ts < ($2::date::timestamp AT TIME ZONE 'America/Chicago') \
+           AND (ts AT TIME ZONE 'America/Chicago')::time >= '08:30' \
+           AND (ts AT TIME ZONE 'America/Chicago')::time < '15:00'",
+    )
+    .bind(symbol)
+    .bind(before)
+    .fetch_one(pool)
+    .await?;
+    let Some(day) = day else { return Ok(None) };
+    let window = "symbol = $1 \
+         AND ts >= (($2::date + time '08:30')::timestamp AT TIME ZONE 'America/Chicago') \
+         AND ts < (($2::date + time '15:00')::timestamp AT TIME ZONE 'America/Chicago')";
+    let rows: Vec<(Decimal, i64)> =
+        sqlx::query_as(&format!("SELECT price, sum(size)::bigint FROM tick_trades WHERE {window} GROUP BY price"))
+            .bind(symbol)
+            .bind(day)
+            .fetch_all(pool)
+            .await?;
+    let span: (Option<chrono::NaiveTime>, Option<chrono::NaiveTime>) = sqlx::query_as(&format!(
+        "SELECT min((ts AT TIME ZONE 'America/Chicago')::time), max((ts AT TIME ZONE 'America/Chicago')::time) FROM tick_trades WHERE {window}"
+    ))
+    .bind(symbol)
+    .bind(day)
+    .fetch_one(pool)
+    .await?;
+    Ok(match span {
+        (Some(first), Some(last)) => Some((day, rows, first, last)),
+        _ => None,
+    })
+}
