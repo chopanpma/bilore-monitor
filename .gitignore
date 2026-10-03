@@ -1,3 +1,7 @@
 /target
 /logs
 .env
+target/
+tests/generated/
+.decispec/
+__pycache__/

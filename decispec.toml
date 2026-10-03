@@ -1,0 +1,10 @@
+[project]
+name = "."
+
+[stack]
+lang = "rust"
+glue_module = "tests.glue"   # python glue: each scenario delegates to one cargo test
+
+[runners]
+# pytest is not installed globally on this machine; uvx fetches and caches it.
+pytest = "uvx pytest"
