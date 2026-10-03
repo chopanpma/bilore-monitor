@@ -3152,6 +3152,7 @@ version = "0.1.0"
 dependencies = [
  "async-nats",
  "chrono",
+ "chrono-tz",
  "feed-connector",
  "futures-util",
  "rust_decimal",
