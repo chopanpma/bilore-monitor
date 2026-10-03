@@ -16,6 +16,7 @@ via `git config core.hooksPath .githooks`). `db.rs` (DB I/O) and `main.rs`
 | `daily_summary.rs` | done (2026-09-28 — end-of-day Telegram summary) | [daily_summary.md](daily_summary.md) |
 | `globex.rs` | done (2026-09-30 — `fade-poc-globex` rule) | [globex.md](globex.md) |
 | `levels.rs` | done (2026-10-02 — prior RTH levels from ticks) | [levels.md](levels.md) |
+| `rolling.rs` | done (2026-10-02 — `fade-roll-*`, user style with rolling levels) | [rolling.md](rolling.md) |
 | `db.rs` | exempt (I/O) | — |
 | `main.rs` | exempt (wiring) | — |
 

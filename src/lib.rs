@@ -5,5 +5,6 @@ pub mod globex;
 pub mod levels;
 pub mod live_signal;
 pub mod period_agg;
+pub mod rolling;
 pub mod sound;
 pub mod telegram;

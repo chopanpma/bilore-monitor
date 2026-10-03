@@ -52,6 +52,7 @@ use bilore_ml_rs::live_state::{LiveModelState, LiveSetup};
 use bilore_core::fade;
 use bilore_monitor::period_agg::{PeriodAggregator, PeriodBar};
 use bilore_backtest::gate;
+use bilore_monitor::rolling::{self, RollConfig, RollingLevels};
 use bilore_monitor::{daily_summary, db, globex, levels, sound, telegram};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use chrono_tz::America::Chicago;
@@ -298,6 +299,21 @@ struct PerSymbolState {
     globex_date: Option<NaiveDate>,
     /// The just-finished RTH session's levels for that Globex session.
     globex_prior: Option<ProfileLevels>,
+    /// `fade-roll-*` (2026-10-02): rolling 30-min levels fed by EVERY tick
+    /// (startup replay included, so the window is warm after a restart) —
+    /// see `bilore_monitor::rolling`.
+    rolling: RollingLevels,
+    /// One slot per `fade-roll-*` window, see `RollSlot`.
+    roll: Vec<RollSlot>,
+}
+
+/// A `fade-roll-*` strategy's slot plus the window instance it belongs to
+/// (`key` = that window's session date while it is in progress, `None`
+/// otherwise). A window change closes anything still open at the mark.
+struct RollSlot {
+    cfg: RollConfig,
+    slot: StrategySlot,
+    key: Option<NaiveDate>,
 }
 
 /// Trains fresh from whatever `period_profiles`/`session_profiles`/
@@ -481,6 +497,29 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
     if let Some(ot) = &globex_slot.open {
         tracing::info!("{symbol}: restored open [{}] trade #{} ({:?})", strategy::FADE_POC_GLOBEX, ot.db_id, ot.trade.outcome);
     }
+
+    // fade-roll-*: keep the open trade of the window in progress, expire
+    // anything left over from a window that ended while we were down.
+    let mut roll = Vec::new();
+    for cfg in rolling::configs() {
+        let key = (rolling::window_of(now_local.time()) == Some(cfg.window)).then(|| rolling::session_date(now_local));
+        let mut slot = StrategySlot::default();
+        for row in db::fetch_open_trades_for_strategy(pool, symbol, cfg.slug).await? {
+            let Some(mut ot) = restore_open_trade(&row) else { continue };
+            if Some(row.session_date) == key && slot.open.is_none() {
+                tracing::info!("{symbol}: restored open [{}] trade #{} ({:?})", cfg.slug, ot.db_id, ot.trade.outcome);
+                slot.open = Some(ot);
+            } else if shadow_trader::close(&mut ot.trade) {
+                tracing::warn!("{symbol}: expiring stale open [{}] trade #{} from {}", cfg.slug, ot.db_id, row.session_date);
+                db::update_shadow_trade_v2(pool, ot.db_id, &ot.trade).await?;
+            }
+        }
+        if let Some(date) = key {
+            let mut stopped = stopped_levels_by_strategy(&db::fetch_stopped_levels(pool, date, symbol).await?);
+            slot.stopped = stopped.remove(cfg.slug).unwrap_or_default();
+        }
+        roll.push(RollSlot { cfg, slot, key });
+    }
     for (slug, s) in [(strategy::ML_MODEL, &ml), (strategy::FADE_POC, &fade), (strategy::FADE_POC_FILL, &fade_fill)] {
         if let Some(ot) = &s.open {
             tracing::info!("{symbol}: restored open [{slug}] trade #{} ({:?})", ot.db_id, ot.trade.outcome);
@@ -510,6 +549,8 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
         globex: globex_slot,
         globex_date,
         globex_prior,
+        rolling: RollingLevels::default(),
+        roll,
     })
 }
 
@@ -700,6 +741,10 @@ async fn main() -> Result<()> {
             for tick in &ticks {
                 state.last_tick_ts = tick.ts;
                 state.tpo.add_trade(tick.price, tick.size.max(0) as u64, tick.ts);
+                let tick_ct = tick.ts.with_timezone(&Chicago).naive_local();
+                // snapshots use completed periods only, so feeding this tick
+                // first can't leak it into this tick's own decision
+                state.rolling.on_tick(tick_ct, tick.price, tick.size.max(0) as u64);
 
                 // Direction-flip invalidation (2026-09-25), before the fill
                 // check below so a flipped setup can't fill on this tick:
@@ -727,7 +772,6 @@ async fn main() -> Result<()> {
                 // fade-poc-globex (2026-09-30), live ticks only — the startup
                 // replay must not open or close Globex sessions.
                 if may_signal(tick.ts, state.live_from) {
-                    let tick_ct = tick.ts.with_timezone(&Chicago).naive_local();
                     let session = globex::globex_session(tick_ct);
                     if session != state.globex_date {
                         // Globex session ended (08:30) or a new one began
@@ -767,14 +811,50 @@ async fn main() -> Result<()> {
                             try_globex_signal(&pool, &http, &bot_token, &chat_id, symbol, &setup_cfg, tick.price, gdate, prior, state).await;
                         }
                     }
+
+                    // fade-roll-* (2026-10-02), one window each.
+                    let buffer = flip_buffer_ticks * state.tick_size;
+                    let (tick_size, tick_value) = (state.tick_size, state.tick_value);
+                    for r in state.roll.iter_mut() {
+                        let key = (rolling::window_of(tick_ct.time()) == Some(r.cfg.window)).then(|| rolling::session_date(tick_ct));
+                        if key != r.key {
+                            if let Some(mut ot) = r.slot.open.take() {
+                                if shadow_trader::close_at_mark(&mut ot.trade, tick.price, tick_size, tick_value) {
+                                    let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
+                                    sound::play(sound::AlertKind::Expired);
+                                    notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, r.cfg.slug, &ot.trade, ot.trust)).await;
+                                }
+                            }
+                            r.slot = StrategySlot::default();
+                            r.key = key;
+                        }
+                        let (Some(date), Some(snap)) = (r.key, state.rolling.snapshot(r.cfg.periods)) else { continue };
+                        let held = r.slot.open.as_ref().map(|ot| ot.trade.direction);
+                        if held.is_some_and(|h| fade::fade_flipped(h, tick.price, snap.poc, buffer)) {
+                            let dir = fade::fade_direction(tick.price, snap.poc);
+                            if let Some(ot) = r.slot.invalidate_on_direction_flip(dir) {
+                                let why = format!(
+                                    "price {} crossed rolling POC {} by more than {flip_buffer_ticks} ticks — fade now {}",
+                                    tick.price, snap.poc, dir_upper(dir)
+                                );
+                                report_invalidated(&pool, &http, &bot_token, &chat_id, symbol, r.cfg.slug, &ot, &why).await;
+                            }
+                        }
+                        if r.slot.is_armed() && r.slot.last_checked_price != Some(tick.price) {
+                            r.slot.last_checked_price = Some(tick.price);
+                            try_roll_signal(&pool, &http, &bot_token, &chat_id, symbol, &setup_cfg, tick.price, date, &snap, r).await;
+                        }
+                    }
                 }
 
-                for (slot, slug) in [
+                let fixed_slots = [
                     (&mut state.ml, strategy::ML_MODEL),
                     (&mut state.fade, strategy::FADE_POC),
                     (&mut state.fade_fill, strategy::FADE_POC_FILL),
                     (&mut state.globex, strategy::FADE_POC_GLOBEX),
-                ] {
+                ];
+                let roll_slots = state.roll.iter_mut().map(|r| (&mut r.slot, r.cfg.slug));
+                for (slot, slug) in fixed_slots.into_iter().chain(roll_slots) {
                     if let Some(ot) = slot.open.as_mut().filter(|ot| ot.sees(tick.ts)) {
                         if shadow_trader::on_price(&mut ot.trade, tick.price, state.tick_size, state.tick_value).is_some() {
                             // Persist every transition, fills included — a
@@ -973,7 +1053,15 @@ async fn send_daily_summary(
     day: NaiveDate,
     roots: &[&str],
 ) {
-    const STRATEGIES: [&str; 4] = [strategy::ML_MODEL, strategy::FADE_POC, strategy::FADE_POC_FILL, strategy::FADE_POC_GLOBEX];
+    const STRATEGIES: [&str; 7] = [
+        strategy::ML_MODEL,
+        strategy::FADE_POC,
+        strategy::FADE_POC_FILL,
+        strategy::FADE_POC_GLOBEX,
+        strategy::FADE_ROLL_EVENING,
+        strategy::FADE_ROLL_OVERNIGHT,
+        strategy::FADE_ROLL_RTH,
+    ];
     let week = db::fetch_summary_rows(pool, daily_summary::week_start(day), day, roots).await;
     let resolved = db::fetch_resolved_gate_rows(pool, roots).await;
     let (week, resolved) = match (week, resolved) {
@@ -1030,6 +1118,52 @@ async fn try_globex_signal(
     let msg = format!(
         "🌙 <b>[V2][{}] SETUP — {symbol}</b>\nDirection : <b>{:?}</b>\nEntry     : <b>{:.2}</b> (waits for a fill)\nStop      : {:.2} (60 ticks)\nTarget    : {:.2} (2R)\nRTH POC   : {:.2} · anchor {}",
         strategy::FADE_POC_GLOBEX, setup.direction, setup.entry, setup.stop, setup.target, prior.poc, setup.anchor
+    );
+    notify(http, bot_token, chat_id, &msg).await;
+}
+
+/// Arm a `fade-roll-*` setup at `price` from the rolling levels (see
+/// `bilore_monitor::rolling`): a Pending trade stored under the window's
+/// session date, with a SETUP alert. Untracked setups are never alerted.
+#[allow(clippy::too_many_arguments)]
+async fn try_roll_signal(
+    pool: &PgPool,
+    http: &reqwest::Client,
+    bot_token: &str,
+    chat_id: &str,
+    symbol: &str,
+    setup_cfg: &TradeSetupConfig,
+    price: Decimal,
+    session_date: NaiveDate,
+    snap: &rolling::Snapshot,
+    r: &mut RollSlot,
+) {
+    let setup = match rolling::roll_setup(price, snap, &r.slot.stopped, r.cfg.geometry, setup_cfg) {
+        Ok(s) => s,
+        Err(reason) => {
+            if r.slot.last_logged_reason.as_deref() != Some(reason.as_str()) {
+                tracing::debug!("{symbol}: no {} setup: {reason}", r.cfg.slug);
+                r.slot.last_logged_reason = Some(reason);
+            }
+            return;
+        }
+    };
+    let trade = ShadowTrade::new(setup.direction, setup.entry, setup.entry, setup.stop, Some(setup.target), 1, true);
+    match db::insert_shadow_trade_v2(pool, session_date, symbol, r.cfg.slug, None, &trade).await {
+        Ok(id) => r.slot.open = Some(OpenTrade { db_id: id, trade, trust: 0.0, since: Utc::now() }),
+        Err(e) => {
+            tracing::error!("{symbol}: insert_shadow_trade_v2 ({}) failed, setup not tracked: {e}", r.cfg.slug);
+            return;
+        }
+    }
+    tracing::info!(
+        "{symbol} LOCKED [{}]: {:?} entry={} stop={} target={} (rolling POC={} over {} periods, anchor {})",
+        r.cfg.slug, setup.direction, setup.entry, setup.stop, setup.target, snap.poc, r.cfg.periods, setup.anchor
+    );
+    sound::play(sound::AlertKind::Setup);
+    let msg = format!(
+        "🔁 <b>[V2][{}] SETUP — {symbol}</b>\nDirection : <b>{:?}</b>\nEntry     : <b>{:.2}</b> (waits for a fill)\nStop      : {:.2}\nTarget    : {:.2}\nRolling   : POC {:.2} · VAH {:.2} · VAL {:.2} ({} periods) · anchor {}",
+        r.cfg.slug, setup.direction, setup.entry, setup.stop, setup.target, snap.poc, snap.vah, snap.val, r.cfg.periods, setup.anchor
     );
     notify(http, bot_token, chat_id, &msg).await;
 }
@@ -1568,6 +1702,7 @@ mod tests {
             outcome: outcome.into(),
             confidence: Some(0.53),
             signal_at: "2026-09-29T14:27:00Z".parse().unwrap(),
+            session_date: chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap(),
         }
     }
 

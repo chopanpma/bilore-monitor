@@ -224,6 +224,7 @@ pub struct OpenTradeRow {
     pub outcome: String,
     pub confidence: Option<f64>,
     pub signal_at: DateTime<Utc>,
+    pub session_date: NaiveDate,
 }
 
 /// Today's open trades for one symbol, newest first.
@@ -231,7 +232,7 @@ pub async fn fetch_open_trades(pool: &PgPool, date: NaiveDate, symbol: &str) -> 
     Ok(sqlx::query_as(
         "SELECT id, strategy, direction, entry_lo::float8 AS entry_lo, entry_hi::float8 AS entry_hi, \
                 stop::float8 AS stop, target_1::float8 AS target_1, entry_price::float8 AS entry_price, \
-                outcome, confidence::float8 AS confidence, signal_at \
+                outcome, confidence::float8 AS confidence, signal_at, session_date \
          FROM shadow_trades_v2 \
          WHERE session_date = $1 AND symbol = $2 AND outcome IN ('pending', 'entered') \
          ORDER BY signal_at DESC",
@@ -303,4 +304,22 @@ pub async fn last_rth_volume_profile(
         (Some(first), Some(last)) => Some((day, rows, first, last)),
         _ => None,
     })
+}
+
+/// Every open (`pending`/`entered`) row of one strategy, any date, newest
+/// first — the fade-roll-* restore keeps the one belonging to the window
+/// in progress and expires the rest (`main.rs` `init_symbol_state`).
+pub async fn fetch_open_trades_for_strategy(pool: &PgPool, symbol: &str, strategy: &str) -> Result<Vec<OpenTradeRow>> {
+    Ok(sqlx::query_as(
+        "SELECT id, strategy, direction, entry_lo::float8 AS entry_lo, entry_hi::float8 AS entry_hi, \
+                stop::float8 AS stop, target_1::float8 AS target_1, entry_price::float8 AS entry_price, \
+                outcome, confidence::float8 AS confidence, signal_at, session_date \
+         FROM shadow_trades_v2 \
+         WHERE symbol = $1 AND strategy = $2 AND outcome IN ('pending', 'entered') \
+         ORDER BY signal_at DESC",
+    )
+    .bind(symbol)
+    .bind(strategy)
+    .fetch_all(pool)
+    .await?)
 }
