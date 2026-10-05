@@ -8,3 +8,4 @@ pub mod period_agg;
 pub mod rolling;
 pub mod sound;
 pub mod telegram;
+pub mod vol_gate;

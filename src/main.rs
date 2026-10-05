@@ -53,6 +53,9 @@ use bilore_core::fade;
 use bilore_monitor::period_agg::{PeriodAggregator, PeriodBar};
 use bilore_backtest::gate;
 use bilore_monitor::rolling::{self, RollConfig, RollingLevels};
+use bilore_core::news;
+use bilore_core::volatility::{Baseline, Release, CALENDAR_UNAVAILABLE};
+use bilore_monitor::vol_gate::{Notice, VolGate};
 use bilore_monitor::{daily_summary, db, globex, levels, sound, telegram};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use chrono_tz::America::Chicago;
@@ -235,6 +238,23 @@ impl StrategySlot {
     }
 }
 
+/// SYS-006: may `slot` create a new setup at `now_ct`? `Ok(false)` when the
+/// slot is busy, `Err(block)` when it is armed but a volatility block is on.
+fn new_setup_check(slot: &StrategySlot, gate: &VolGate, now_ct: chrono::NaiveDateTime) -> Result<bool, bilore_core::volatility::Block> {
+    if !slot.is_armed() {
+        return Ok(false);
+    }
+    gate.may_open(now_ct).map(|()| true)
+}
+
+/// Advance `slot`'s open trade on one live trade (fill, stop, target). The
+/// volatility gate is deliberately not an input: blocks only stop new
+/// setups (user, 2026-10-04).
+fn advance_open_trade(slot: &mut StrategySlot, tick_ts: DateTime<Utc>, price: Decimal, tick_size: Decimal, tick_value: Decimal) -> Option<shadow_trader::Transition> {
+    let ot = slot.open.as_mut().filter(|ot| ot.sees(tick_ts))?;
+    shadow_trader::on_price(&mut ot.trade, price, tick_size, tick_value)
+}
+
 struct TrainedModel {
     models: Vec<LogisticModel>, // [p_bullish, p_break_vah, p_break_val, p_return_poc]
     quality: ModelQuality,
@@ -305,6 +325,9 @@ struct PerSymbolState {
     rolling: RollingLevels,
     /// One slot per `fade-roll-*` window, see `RollSlot`.
     roll: Vec<RollSlot>,
+    /// Volatility gate (bilore-specs SYS-006, 2026-10-04): no NEW setups
+    /// during releases, the opens and 30-second spikes. Fed every tick.
+    vol: VolGate,
 }
 
 /// A `fade-roll-*` strategy's slot plus the window instance it belongs to
@@ -551,7 +574,63 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
         globex_prior,
         rolling: RollingLevels::default(),
         roll,
+        vol: VolGate::new(load_vol_baseline(pool, symbol, today_ct).await, None),
     })
+}
+
+/// SYS-006 baseline: the 30-second ranges of ~the prior 20 sessions (28
+/// calendar days before `today_ct`). A failed load leaves the spike check
+/// off (empty baseline) — release and open windows still apply.
+async fn load_vol_baseline(pool: &PgPool, symbol: &str, today_ct: NaiveDate) -> Baseline {
+    let day_start = |d: NaiveDate| {
+        d.and_hms_opt(0, 0, 0).unwrap().and_local_timezone(Chicago).earliest().map(|t| t.with_timezone(&Utc))
+    };
+    let (Some(from), Some(to)) = (day_start(today_ct - ChronoDuration::days(28)), day_start(today_ct)) else {
+        return Baseline::default();
+    };
+    match db::fetch_range_samples(pool, symbol, from, to).await {
+        Ok(samples) => {
+            tracing::info!("{symbol}: volatility baseline from {} 30-s samples", samples.len());
+            Baseline::build(&samples)
+        }
+        Err(e) => {
+            tracing::error!("{symbol}: volatility baseline load failed, spike check off: {e}");
+            Baseline::default()
+        }
+    }
+}
+
+/// SYS-006: the week's high-impact US releases from the ForexFactory feed
+/// (parser shared with bilore-cockpit, `bilore_core::news`).
+async fn fetch_calendar(http: &reqwest::Client) -> Result<Vec<Release>> {
+    let xml = http
+        .get(news::FEED_URL)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    Ok(news::try_parse_events(&xml)?
+        .into_iter()
+        .map(|e| Release { name: e.name, at: e.time_ct.naive_local() })
+        .collect())
+}
+
+/// SYS-006 for one slot: `true` when it may create a setup now. A block is
+/// logged once per reason (shares `last_logged_reason` with the NoSetup log).
+fn gate_allows(slot: &mut StrategySlot, gate: &VolGate, now_ct: chrono::NaiveDateTime, symbol: &str, slug: &str) -> bool {
+    match new_setup_check(slot, gate, now_ct) {
+        Ok(armed) => armed,
+        Err(block) => {
+            let why = block.to_string();
+            if slot.last_logged_reason.as_deref() != Some(why.as_str()) {
+                tracing::info!("{symbol}: [{slug}] setup skipped — {why}");
+                slot.last_logged_reason = Some(why);
+            }
+            false
+        }
+    }
 }
 
 #[tokio::main]
@@ -652,9 +731,36 @@ async fn main() -> Result<()> {
         r
     };
     let summary_roots: Vec<&str> = summary_root_names.iter().map(String::as_str).collect();
+    // SYS-006 news calendar: refreshed every 15 min (the feed rate-limits
+    // bursts). A failed fetch keeps the last good week; until the first
+    // success every gate runs without releases (entries continue, warned).
+    let (cal_tx, mut cal_rx) = tokio::sync::watch::channel::<Option<Vec<Release>>>(None);
+    {
+        let http = http.clone();
+        tokio::spawn(async move {
+            loop {
+                match fetch_calendar(&http).await {
+                    Ok(cal) => {
+                        tracing::info!("news calendar: {} high-impact US releases this week", cal.len());
+                        cal_tx.send_replace(Some(cal));
+                    }
+                    Err(e) => tracing::warn!("{CALENDAR_UNAVAILABLE}: {e}"),
+                }
+                tokio::time::sleep(Duration::from_secs(15 * 60)).await;
+            }
+        });
+    }
+
     let mut tick_interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         tick_interval.tick().await;
+
+        if cal_rx.has_changed().unwrap_or(false) {
+            let cal = cal_rx.borrow_and_update().clone();
+            for state in states.values_mut() {
+                state.vol.set_calendar(cal.clone());
+            }
+        }
 
         if !pending.is_empty() && (Utc::now() - last_pending_retry) >= ChronoDuration::seconds(60) {
             last_pending_retry = Utc::now();
@@ -663,8 +769,9 @@ async fn main() -> Result<()> {
             for symbol in pending.drain(..) {
                 let bf = bridge_from_for(&symbol);
                 match init_symbol_state(&pool, &symbol, bf.as_deref(), today_ct).await {
-                    Ok(s) => {
+                    Ok(mut s) => {
                         tracing::info!("{symbol} now has enough data — activating");
+                        s.vol.set_calendar(cal_rx.borrow().clone());
                         states.insert(symbol, s);
                     }
                     Err(_) => still_pending.push(symbol),
@@ -717,6 +824,7 @@ async fn main() -> Result<()> {
                 state.ml = StrategySlot::default();
                 state.fade = StrategySlot::default();
                 state.fade_fill = StrategySlot::default();
+                state.vol.set_baseline(load_vol_baseline(&pool, symbol, now_ct).await);
                 match train(&pool, symbol, bf.as_deref()).await {
                     Ok(t) => state.trained = t,
                     Err(e) => tracing::error!("{symbol}: retrain failed, keeping yesterday's model: {e}"),
@@ -745,6 +853,21 @@ async fn main() -> Result<()> {
                 // snapshots use completed periods only, so feeding this tick
                 // first can't leak it into this tick's own decision
                 state.rolling.on_tick(tick_ct, tick.price, tick.size.max(0) as u64);
+
+                // SYS-006 volatility gate: every tick feeds the 30-second
+                // window; block changes are announced on live ticks only
+                // (the startup replay must not re-send old notices).
+                state.vol.on_tick(tick_ct, tick.price);
+                if may_signal(tick.ts, state.live_from) {
+                    if let Some(notice) = state.vol.update(tick_ct) {
+                        let text = match &notice {
+                            Notice::Started { block, until } => telegram::volatility_started_message(symbol, block, until),
+                            Notice::Ended { block } => telegram::volatility_over_message(symbol, block),
+                        };
+                        tracing::info!("{symbol}: {notice:?}");
+                        notify(&http, &bot_token, &chat_id, &text).await;
+                    }
+                }
 
                 // Direction-flip invalidation (2026-09-25), before the fill
                 // check below so a flipped setup can't fill on this tick:
@@ -806,7 +929,9 @@ async fn main() -> Result<()> {
                                 report_invalidated(&pool, &http, &bot_token, &chat_id, symbol, strategy::FADE_POC_GLOBEX, &ot, &why).await;
                             }
                         }
-                        if state.globex.is_armed() && state.globex.last_checked_price != Some(tick.price) {
+                        if state.globex.last_checked_price != Some(tick.price)
+                            && gate_allows(&mut state.globex, &state.vol, tick_ct, symbol, strategy::FADE_POC_GLOBEX)
+                        {
                             state.globex.last_checked_price = Some(tick.price);
                             try_globex_signal(&pool, &http, &bot_token, &chat_id, symbol, &setup_cfg, tick.price, gdate, prior, state).await;
                         }
@@ -815,6 +940,7 @@ async fn main() -> Result<()> {
                     // fade-roll-* (2026-10-02), one window each.
                     let buffer = flip_buffer_ticks * state.tick_size;
                     let (tick_size, tick_value) = (state.tick_size, state.tick_value);
+                    let vol = &state.vol;
                     for r in state.roll.iter_mut() {
                         let key = (rolling::window_of(tick_ct.time()) == Some(r.cfg.window)).then(|| rolling::session_date(tick_ct));
                         if key != r.key {
@@ -840,7 +966,7 @@ async fn main() -> Result<()> {
                                 report_invalidated(&pool, &http, &bot_token, &chat_id, symbol, r.cfg.slug, &ot, &why).await;
                             }
                         }
-                        if r.slot.is_armed() && r.slot.last_checked_price != Some(tick.price) {
+                        if r.slot.last_checked_price != Some(tick.price) && gate_allows(&mut r.slot, vol, tick_ct, symbol, r.cfg.slug) {
                             r.slot.last_checked_price = Some(tick.price);
                             try_roll_signal(&pool, &http, &bot_token, &chat_id, symbol, &setup_cfg, tick.price, date, &snap, r).await;
                         }
@@ -855,8 +981,10 @@ async fn main() -> Result<()> {
                 ];
                 let roll_slots = state.roll.iter_mut().map(|r| (&mut r.slot, r.cfg.slug));
                 for (slot, slug) in fixed_slots.into_iter().chain(roll_slots) {
-                    if let Some(ot) = slot.open.as_mut().filter(|ot| ot.sees(tick.ts)) {
-                        if shadow_trader::on_price(&mut ot.trade, tick.price, state.tick_size, state.tick_value).is_some() {
+                    // Fills and exits never consult the volatility gate
+                    // (SYS-006: blocks stop new setups only).
+                    if advance_open_trade(slot, tick.ts, tick.price, state.tick_size, state.tick_value).is_some() {
+                        if let Some(ot) = slot.open.as_ref() {
                             // Persist every transition, fills included — a
                             // restart restores open trades from the DB
                             // (restore_open_trade), so an Entered trade must
@@ -891,8 +1019,8 @@ async fn main() -> Result<()> {
                 if live
                     && state.prior.is_some()
                     && state.last_completed.is_some()
-                    && state.fade.is_armed()
                     && state.fade.last_checked_price != Some(tick.price)
+                    && gate_allows(&mut state.fade, &state.vol, tick_ct, symbol, strategy::FADE_POC)
                 {
                     state.fade.last_checked_price = Some(tick.price);
                     try_fade_signal(
@@ -904,8 +1032,8 @@ async fn main() -> Result<()> {
                 if live
                     && state.prior.is_some()
                     && state.last_completed.is_some()
-                    && state.fade_fill.is_armed()
                     && state.fade_fill.last_checked_price != Some(tick.price)
+                    && gate_allows(&mut state.fade_fill, &state.vol, tick_ct, symbol, strategy::FADE_POC_FILL)
                 {
                     state.fade_fill.last_checked_price = Some(tick.price);
                     try_fade_signal(
@@ -938,7 +1066,7 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    if live && state.prior.is_some() && state.ml.is_armed() {
+                    if live && state.prior.is_some() && gate_allows(&mut state.ml, &state.vol, tick_ct, symbol, strategy::ML_MODEL) {
                         try_signal(
                             &pool, &http, &bot_token, &chat_id, nats.as_ref(), symbol,
                             &risk_cfg, &setup_cfg, state,
@@ -1797,5 +1925,56 @@ mod tests {
         let d = |s: &str| s.parse::<Decimal>().unwrap();
         assert_eq!(by.get("fade-poc"), Some(&vec![(Direction::Short, d("7747.75"))]));
         assert_eq!(by.get("ml-model"), Some(&vec![(Direction::Long, d("7731.00"))]));
+    }
+
+    // ---- SYS-006 volatility block (2026-10-04) ----
+
+    fn ct(h: u32, m: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap().and_hms_opt(h, m, 0).unwrap()
+    }
+
+    fn gate() -> VolGate {
+        VolGate::new(bilore_core::volatility::Baseline::default(), Some(vec![]))
+    }
+
+    #[test]
+    fn no_new_setup_during_a_block() {
+        let slot = StrategySlot::default();
+        assert_eq!(
+            new_setup_check(&slot, &gate(), ct(8, 40)),
+            Err(bilore_core::volatility::Block::Open(bilore_core::volatility::OpenKind::Rth))
+        );
+    }
+
+    #[test]
+    fn an_armed_slot_may_create_a_setup_when_quiet() {
+        assert_eq!(new_setup_check(&StrategySlot::default(), &gate(), ct(10, 30)), Ok(true));
+    }
+
+    #[test]
+    fn a_busy_slot_creates_nothing_with_or_without_a_block() {
+        let slot = pending_short_slot();
+        assert_eq!(new_setup_check(&slot, &gate(), ct(10, 30)), Ok(false));
+        assert_eq!(new_setup_check(&slot, &gate(), ct(8, 40)), Ok(false));
+    }
+
+    #[test]
+    fn pending_setup_still_fills_during_a_block() {
+        let d = |s: &str| s.parse::<Decimal>().unwrap();
+        let mut slot = pending_short_slot();
+        assert!(gate().may_open(ct(8, 40)).is_err(), "a block is on");
+        let t = advance_open_trade(&mut slot, "2026-10-05T13:40:00Z".parse().unwrap(), d("5812.25"), d("0.25"), d("1.25"));
+        assert_eq!(t, Some(shadow_trader::Transition::Entered));
+    }
+
+    #[test]
+    fn open_position_still_exits_during_a_block() {
+        let d = |s: &str| s.parse::<Decimal>().unwrap();
+        let mut slot = pending_short_slot();
+        let ts: DateTime<Utc> = "2026-10-05T13:40:00Z".parse().unwrap();
+        advance_open_trade(&mut slot, ts, d("5812.25"), d("0.25"), d("1.25"));
+        assert!(gate().may_open(ct(8, 41)).is_err(), "a block is on");
+        let t = advance_open_trade(&mut slot, ts + ChronoDuration::seconds(30), d("5822.25"), d("0.25"), d("1.25"));
+        assert_eq!(t, Some(shadow_trader::Transition::Lost));
     }
 }

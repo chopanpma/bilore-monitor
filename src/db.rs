@@ -323,3 +323,33 @@ pub async fn fetch_open_trades_for_strategy(pool: &PgPool, symbol: &str, strateg
     .fetch_all(pool)
     .await?)
 }
+
+/// 30-second ranges of `symbol` between `from` and `to`, one per 5-second
+/// bucket (max-min over that bucket and the 5 before it), as Chicago wall
+/// clock — the baseline samples for the volatility gate (bilore-specs
+/// SYS-006). The caller passes ~28 calendar days ending at today's start,
+/// i.e. about the prior 20 sessions.
+pub async fn fetch_range_samples(
+    pool: &PgPool,
+    symbol: &str,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<Vec<bilore_core::volatility::RangeSample>> {
+    let rows: Vec<(chrono::NaiveDateTime, Decimal)> = sqlx::query_as(
+        "WITH b AS ( \
+           SELECT date_bin('5 seconds', ts, TIMESTAMPTZ '2000-01-01') AS t, max(price) AS hi, min(price) AS lo \
+           FROM tick_trades WHERE symbol = $1 AND ts >= $2 AND ts < $3 GROUP BY 1) \
+         SELECT (t AT TIME ZONE 'America/Chicago') AS at, \
+                (max(hi) OVER w - min(lo) OVER w)::float8::numeric AS range \
+         FROM b WINDOW w AS (ORDER BY t RANGE BETWEEN INTERVAL '25 seconds' PRECEDING AND CURRENT ROW)",
+    )
+    .bind(symbol)
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(at, range)| bilore_core::volatility::RangeSample { session: at.date(), at, range })
+        .collect())
+}

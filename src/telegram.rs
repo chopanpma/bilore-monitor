@@ -10,6 +10,9 @@ use bilore_core::market_structure::Direction;
 use bilore_core::shadow_trader::{Outcome, ShadowTrade};
 use rust_decimal::Decimal;
 
+use crate::vol_gate::Until;
+use bilore_core::volatility::Block;
+
 fn direction_str(d: Direction) -> &'static str {
     match d {
         Direction::Long => "LONG",
@@ -94,6 +97,39 @@ pub async fn send(client: &reqwest::Client, token: &str, chat_id: &str, text: &s
         .await?
         .error_for_status()?;
     Ok(())
+}
+
+/// SYS-006-R8: a volatility block started — no new setups until it ends.
+pub fn volatility_started_message(symbol: &str, block: &Block, until: &Until) -> String {
+    let until = match until {
+        Until::At(t) => format!("until {} CT", t.format("%H:%M")),
+        Until::CalmMinutes(m) => format!("until {m} calm minutes"),
+    };
+    format!(
+        "⚠️ <b>[V2] VOLATILITY — {symbol}</b>\n\
+         No new setups: {} {until}\n\
+         Pending setups may still fill; open trades keep their stop and target.",
+        volatility_reason(block),
+    )
+}
+
+fn volatility_reason(block: &Block) -> String {
+    use bilore_core::volatility::OpenKind;
+    match block {
+        Block::Release(name) => format!("release {name}"),
+        Block::Open(OpenKind::Rth) => "RTH open".to_string(),
+        Block::Open(OpenKind::GlobexReopen) => "Globex reopen".to_string(),
+        Block::Spike(ratio) => format!("spike {}x the normal 30-second move", ratio.round_dp(1)),
+    }
+}
+
+/// SYS-006-R8: the block ended — new setups allowed again.
+pub fn volatility_over_message(symbol: &str, block: &Block) -> String {
+    format!(
+        "✅ <b>[V2] VOLATILITY OVER — {symbol}</b>\n\
+         New setups allowed again (was: {})",
+        volatility_reason(block),
+    )
 }
 
 #[cfg(test)]
@@ -183,5 +219,37 @@ mod tests {
         assert!(msg.contains("5812.25"), "{msg}");
         assert!(msg.contains("never filled"), "{msg}");
         assert!(msg.contains("direction flipped to LONG"), "{msg}");
+    }
+
+    fn ct(h: u32, m: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap().and_hms_opt(h, m, 0).unwrap()
+    }
+
+    #[test]
+    fn volatility_message_names_the_reason_and_when_it_ends() {
+        let nfp = volatility_started_message(
+            "MESZ6",
+            &Block::Release("Non-Farm Employment Change".into()),
+            &Until::At(ct(7, 45)),
+        );
+        assert!(nfp.contains("[V2] VOLATILITY — MESZ6"), "{nfp}");
+        assert!(nfp.contains("No new setups"), "{nfp}");
+        assert!(nfp.contains("release Non-Farm Employment Change"), "{nfp}");
+        assert!(nfp.contains("until 07:45 CT"), "{nfp}");
+
+        let spike = volatility_started_message("MESZ6", &Block::Spike("4.43".parse().unwrap()), &Until::CalmMinutes(5));
+        assert!(spike.contains("spike 4.4x the normal 30-second move"), "{spike}");
+        assert!(spike.contains("until 5 calm minutes"), "{spike}");
+
+        let open = volatility_started_message("MESZ6", &Block::Open(bilore_core::volatility::OpenKind::Rth), &Until::At(ct(9, 0)));
+        assert!(open.contains("RTH open") && open.contains("until 09:00 CT"), "{open}");
+    }
+
+    #[test]
+    fn volatility_over_message_says_setups_are_allowed_again() {
+        let msg = volatility_over_message("MESZ6", &Block::Open(bilore_core::volatility::OpenKind::GlobexReopen));
+        assert!(msg.contains("[V2] VOLATILITY OVER — MESZ6"), "{msg}");
+        assert!(msg.contains("New setups allowed again"), "{msg}");
+        assert!(msg.contains("was: Globex reopen"), "{msg}");
     }
 }
