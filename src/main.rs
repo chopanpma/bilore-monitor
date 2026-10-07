@@ -53,8 +53,10 @@ use bilore_core::fade;
 use bilore_monitor::period_agg::{PeriodAggregator, PeriodBar};
 use bilore_backtest::gate;
 use bilore_monitor::rolling::{self, RollConfig, RollingLevels};
+use bilore_core::inventory::{self, ReferenceProfile};
 use bilore_core::news;
 use bilore_core::volatility::{Baseline, Release, CALENDAR_UNAVAILABLE};
+use bilore_monitor::va_alert;
 use bilore_monitor::vol_gate::{Notice, VolGate};
 use bilore_monitor::{daily_summary, db, globex, levels, sound, telegram};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
@@ -255,6 +257,11 @@ fn advance_open_trade(slot: &mut StrategySlot, tick_ts: DateTime<Utc>, price: De
     shadow_trader::on_price(&mut ot.trade, price, tick_size, tick_value)
 }
 
+/// MON-012: only finished trades with a real outcome go to Telegram.
+fn result_goes_to_telegram(outcome: Outcome) -> bool {
+    matches!(outcome, Outcome::Won | Outcome::Lost)
+}
+
 struct TrainedModel {
     models: Vec<LogisticModel>, // [p_bullish, p_break_vah, p_break_val, p_return_poc]
     quality: ModelQuality,
@@ -328,6 +335,63 @@ struct PerSymbolState {
     /// Volatility gate (bilore-specs SYS-006, 2026-10-04): no NEW setups
     /// during releases, the opens and 30-second spikes. Fed every tick.
     vol: VolGate,
+    /// Manual-trading value-area alert (MON-011, 2026-10-07).
+    va: VaState,
+}
+
+/// Everything MON-011 tracks for the current RTH or Globex session: the
+/// developing profile, the session's 5-min bars (structure), its cumulative
+/// tick-rule delta (order flow), the prior 1/5/20-session composites of the
+/// same session type (other timeframe) and the once-per-period throttle.
+struct VaState {
+    profile: va_alert::DevelopingProfile,
+    bars: bilore_core::bar_builder::BarBuilder,
+    session_bars: Vec<bilore_core::market_structure::Bar>,
+    classifier: bilore_core::order_flow::TickRuleClassifier,
+    delta: i64,
+    composite: Option<(ReferenceProfile, ReferenceProfile, ReferenceProfile)>,
+    throttle: va_alert::AlertThrottle,
+    last_price: Option<Decimal>,
+}
+
+impl Default for VaState {
+    fn default() -> Self {
+        Self {
+            profile: va_alert::DevelopingProfile::default(),
+            bars: bilore_core::bar_builder::BarBuilder::new(5),
+            session_bars: Vec::new(),
+            classifier: bilore_core::order_flow::TickRuleClassifier::default(),
+            delta: 0,
+            composite: None,
+            throttle: va_alert::AlertThrottle::default(),
+            last_price: None,
+        }
+    }
+}
+
+/// MON-011 other timeframe: the prior day/week/month composites of the
+/// session's own type (`MESZ6` RTH, `MESZ6-GLOBEX` Globex) before its date.
+async fn load_va_composite(
+    pool: &PgPool,
+    symbol: &str,
+    session: &va_alert::SessionId,
+) -> Option<(ReferenceProfile, ReferenceProfile, ReferenceProfile)> {
+    let sym = match session.kind {
+        va_alert::SessionKind::Rth => symbol.to_string(),
+        va_alert::SessionKind::Globex => format!("{symbol}-GLOBEX"),
+    };
+    let mut trio = Vec::with_capacity(3);
+    for n in [1, 5, 20] {
+        match db::fetch_composite_profile(pool, &sym, session.start.date(), n).await {
+            Ok(Some(p)) => trio.push(p),
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!("{symbol}: composite load failed ({sym}, {n} sessions), other timeframe off: {e}");
+                return None;
+            }
+        }
+    }
+    Some((trio[0], trio[1], trio[2]))
 }
 
 /// A `fade-roll-*` strategy's slot plus the window instance it belongs to
@@ -575,6 +639,7 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
         rolling: RollingLevels::default(),
         roll,
         vol: VolGate::new(load_vol_baseline(pool, symbol, today_ct).await, None),
+        va: VaState::default(),
     })
 }
 
@@ -720,17 +785,8 @@ async fn main() -> Result<()> {
 
     let mut last_pending_retry = Utc::now();
     // In-memory only: a restart inside the 15:00–16:00 CT window re-sends.
-    let mut last_summary: Option<NaiveDate> = None;
     // Summary scope = roots of the symbols this process trades (SYMBOLS),
     // so it follows the MES-only decision (2026-09-29) automatically.
-    let summary_root_names: Vec<String> = {
-        let mut r: Vec<String> =
-            registered.iter().filter_map(|s| bilore_core::instrument::futures_root(s)).map(str::to_string).collect();
-        r.sort();
-        r.dedup();
-        r
-    };
-    let summary_roots: Vec<&str> = summary_root_names.iter().map(String::as_str).collect();
     // SYS-006 news calendar: refreshed every 15 min (the feed rate-limits
     // bursts). A failed fetch keeps the last good week; until the first
     // success every gate runs without releases (entries continue, warned).
@@ -780,11 +836,6 @@ async fn main() -> Result<()> {
             pending = still_pending;
         }
 
-        if let Some(day) = daily_summary::summary_due(Utc::now(), last_summary) {
-            last_summary = Some(day);
-            send_daily_summary(&pool, &http, &bot_token, &chat_id, day, &summary_roots).await;
-        }
-
         for (symbol, state) in states.iter_mut() {
             let bf = bridge_from_for(symbol);
             let now_ct = Utc::now().with_timezone(&Chicago).date_naive();
@@ -793,21 +844,27 @@ async fn main() -> Result<()> {
                     if shadow_trader::close(&mut ot.trade) {
                         let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
                         sound::play(sound::AlertKind::Expired);
-                        notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, strategy::ML_MODEL, &ot.trade, ot.trust)).await;
+                        if result_goes_to_telegram(ot.trade.outcome) {
+                            notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, strategy::ML_MODEL, &ot.trade, ot.trust)).await;
+                        }
                     }
                 }
                 if let Some(mut ot) = state.fade.open.take() {
                     if shadow_trader::close(&mut ot.trade) {
                         let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
                         sound::play(sound::AlertKind::Expired);
-                        notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, strategy::FADE_POC, &ot.trade, ot.trust)).await;
+                        if result_goes_to_telegram(ot.trade.outcome) {
+                            notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, strategy::FADE_POC, &ot.trade, ot.trust)).await;
+                        }
                     }
                 }
                 if let Some(mut ot) = state.fade_fill.open.take() {
                     if shadow_trader::close(&mut ot.trade) {
                         let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
                         sound::play(sound::AlertKind::Expired);
-                        notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, strategy::FADE_POC_FILL, &ot.trade, ot.trust)).await;
+                        if result_goes_to_telegram(ot.trade.outcome) {
+                            notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, strategy::FADE_POC_FILL, &ot.trade, ot.trust)).await;
+                        }
                     }
                 }
                 state.today_ct = now_ct;
@@ -864,8 +921,8 @@ async fn main() -> Result<()> {
                             Notice::Started { block, until } => telegram::volatility_started_message(symbol, block, until),
                             Notice::Ended { block } => telegram::volatility_over_message(symbol, block),
                         };
-                        tracing::info!("{symbol}: {notice:?}");
-                        notify(&http, &bot_token, &chat_id, &text).await;
+                        // SYS-006-R8 / MON-012: logged, not sent to Telegram.
+                        tracing::info!("{symbol}: {}", text.replace("<b>", "").replace("</b>", ""));
                     }
                 }
 
@@ -887,7 +944,52 @@ async fn main() -> Result<()> {
                                 "price {} crossed prior POC {} by more than {flip_buffer_ticks} ticks — fade now {}",
                                 tick.price, prior.poc, dir_upper(dir)
                             );
-                            report_invalidated(&pool, &http, &bot_token, &chat_id, symbol, slug, &ot, &why).await;
+                            report_invalidated(&pool, symbol, slug, &ot, &why).await;
+                        }
+                    }
+                }
+
+                // MON-011 value-area alert: every tick builds the session's
+                // profile, 5-min bars and delta (the startup replay warms
+                // them up); alerts go out on live ticks only.
+                let prev_session = state.va.profile.session;
+                state.va.profile.on_trade(tick_ct, tick.price, tick.size.max(0) as u64);
+                if state.va.profile.session != prev_session {
+                    let session = state.va.profile.session;
+                    state.va = VaState { profile: state.va.profile.clone(), throttle: state.va.throttle.clone(), ..VaState::default() };
+                    if let Some(s) = session {
+                        state.va.composite = load_va_composite(&pool, symbol, &s).await;
+                        tracing::info!("{symbol}: value-area alert tracking {:?} session from {} (other timeframe {})", s.kind, s.start, if state.va.composite.is_some() { "loaded" } else { "unavailable" });
+                    }
+                }
+                if state.va.profile.session.is_some() && va_alert::session_of(tick_ct) == state.va.profile.session {
+                    if let Some(bar) = state.va.bars.on_tick(tick) {
+                        state.va.session_bars.push(bar);
+                    }
+                    state.va.delta += match state.va.classifier.classify(tick.price) {
+                        bilore_core::order_flow::Side::Buy => tick.size,
+                        bilore_core::order_flow::Side::Sell => -tick.size,
+                    };
+                    if let Some(poc) = state.va.profile.volume.poc() {
+                        state.va.throttle.observe(tick.price, poc);
+                    }
+                    if may_signal(tick.ts, state.live_from) && state.va.last_price != Some(tick.price) {
+                        state.va.last_price = Some(tick.price);
+                        let structure = bilore_core::market_structure::structure_direction(
+                            &bilore_core::market_structure::analyze_structure(&state.va.session_bars, Some(tick.price), 3),
+                        );
+                        let otf = state.va.composite.as_ref().and_then(|(d, w, m)| inventory::participant_view(d, w, m, tick.price).lean);
+                        let factors = va_alert::Factors { structure, delta: state.va.delta, otf };
+                        if let Some(alert) = va_alert::evaluate(&state.va.profile, tick_ct, tick.price, &factors, state.tick_size) {
+                            if state.va.throttle.should_send(&alert) {
+                                let text = va_alert::render_profile(&state.va.profile.volume, alert.vah, alert.poc, alert.val, alert.price, state.tick_size, 24);
+                                let mut msg = telegram::va_alert_message(symbol, &alert, &text);
+                                if let Err(block) = state.vol.may_open(tick_ct) {
+                                    msg.push_str(&format!("\n⚠️ {block} — the strategies take no new setups right now"));
+                                }
+                                tracing::info!("{symbol}: value-area alert {:?} fade {:?} at {}, {}/3 aligned", alert.side, alert.fade, alert.price, alert.agreeing());
+                                notify(&http, &bot_token, &chat_id, &msg).await;
+                            }
                         }
                     }
                 }
@@ -903,7 +1005,9 @@ async fn main() -> Result<()> {
                             if shadow_trader::close_at_mark(&mut ot.trade, tick.price, state.tick_size, state.tick_value) {
                                 let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
                                 sound::play(sound::AlertKind::Expired);
-                                notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, strategy::FADE_POC_GLOBEX, &ot.trade, ot.trust)).await;
+                                if result_goes_to_telegram(ot.trade.outcome) {
+                            notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, strategy::FADE_POC_GLOBEX, &ot.trade, ot.trust)).await;
+                        }
                             }
                         }
                         state.globex = StrategySlot::default();
@@ -926,14 +1030,14 @@ async fn main() -> Result<()> {
                                     "price {} crossed RTH POC {} by more than {flip_buffer_ticks} ticks — fade now {}",
                                     tick.price, prior.poc, dir_upper(dir)
                                 );
-                                report_invalidated(&pool, &http, &bot_token, &chat_id, symbol, strategy::FADE_POC_GLOBEX, &ot, &why).await;
+                                report_invalidated(&pool, symbol, strategy::FADE_POC_GLOBEX, &ot, &why).await;
                             }
                         }
                         if state.globex.last_checked_price != Some(tick.price)
                             && gate_allows(&mut state.globex, &state.vol, tick_ct, symbol, strategy::FADE_POC_GLOBEX)
                         {
                             state.globex.last_checked_price = Some(tick.price);
-                            try_globex_signal(&pool, &http, &bot_token, &chat_id, symbol, &setup_cfg, tick.price, gdate, prior, state).await;
+                            try_globex_signal(&pool, symbol, &setup_cfg, tick.price, gdate, prior, state).await;
                         }
                     }
 
@@ -948,7 +1052,9 @@ async fn main() -> Result<()> {
                                 if shadow_trader::close_at_mark(&mut ot.trade, tick.price, tick_size, tick_value) {
                                     let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
                                     sound::play(sound::AlertKind::Expired);
-                                    notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, r.cfg.slug, &ot.trade, ot.trust)).await;
+                                    if result_goes_to_telegram(ot.trade.outcome) {
+                            notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, r.cfg.slug, &ot.trade, ot.trust)).await;
+                        }
                                 }
                             }
                             r.slot = StrategySlot::default();
@@ -963,12 +1069,12 @@ async fn main() -> Result<()> {
                                     "price {} crossed rolling POC {} by more than {flip_buffer_ticks} ticks — fade now {}",
                                     tick.price, snap.poc, dir_upper(dir)
                                 );
-                                report_invalidated(&pool, &http, &bot_token, &chat_id, symbol, r.cfg.slug, &ot, &why).await;
+                                report_invalidated(&pool, symbol, r.cfg.slug, &ot, &why).await;
                             }
                         }
                         if r.slot.last_checked_price != Some(tick.price) && gate_allows(&mut r.slot, vol, tick_ct, symbol, r.cfg.slug) {
                             r.slot.last_checked_price = Some(tick.price);
-                            try_roll_signal(&pool, &http, &bot_token, &chat_id, symbol, &setup_cfg, tick.price, date, &snap, r).await;
+                            try_roll_signal(&pool, symbol, &setup_cfg, tick.price, date, &snap, r).await;
                         }
                     }
                 }
@@ -990,9 +1096,11 @@ async fn main() -> Result<()> {
                             // (restore_open_trade), so an Entered trade must
                             // not read back as still Pending.
                             let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
-                            if matches!(ot.trade.outcome, Outcome::Won | Outcome::Lost) {
+                            if result_goes_to_telegram(ot.trade.outcome) {
                                 sound::play(if ot.trade.outcome == Outcome::Won { sound::AlertKind::Won } else { sound::AlertKind::Lost });
-                                notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, slug, &ot.trade, ot.trust)).await;
+                                if result_goes_to_telegram(ot.trade.outcome) {
+                            notify(&http, &bot_token, &chat_id, &telegram::result_message(symbol, slug, &ot.trade, ot.trust)).await;
+                        }
                             }
                         }
                     }
@@ -1024,7 +1132,7 @@ async fn main() -> Result<()> {
                 {
                     state.fade.last_checked_price = Some(tick.price);
                     try_fade_signal(
-                        &pool, &http, &bot_token, &chat_id, nats.as_ref(), symbol,
+                        &pool, nats.as_ref(), symbol,
                         &risk_cfg, &setup_cfg, tick.price, strategy::FADE_POC, true, state,
                     )
                     .await;
@@ -1037,7 +1145,7 @@ async fn main() -> Result<()> {
                 {
                     state.fade_fill.last_checked_price = Some(tick.price);
                     try_fade_signal(
-                        &pool, &http, &bot_token, &chat_id, nats.as_ref(), symbol,
+                        &pool, nats.as_ref(), symbol,
                         &risk_cfg, &setup_cfg, tick.price, strategy::FADE_POC_FILL, false, state,
                     )
                     .await;
@@ -1062,13 +1170,13 @@ async fn main() -> Result<()> {
                     if let Some(score) = score_ml(state, &risk_cfg) {
                         if let Some(ot) = state.ml.invalidate_on_direction_flip(score.direction) {
                             let why = format!("ml-model lean flipped to {} (period {})", dir_upper(score.direction), score.next_period_idx);
-                            report_invalidated(&pool, &http, &bot_token, &chat_id, symbol, strategy::ML_MODEL, &ot, &why).await;
+                            report_invalidated(&pool, symbol, strategy::ML_MODEL, &ot, &why).await;
                         }
                     }
 
                     if live && state.prior.is_some() && gate_allows(&mut state.ml, &state.vol, tick_ct, symbol, strategy::ML_MODEL) {
                         try_signal(
-                            &pool, &http, &bot_token, &chat_id, nats.as_ref(), symbol,
+                            &pool, nats.as_ref(), symbol,
                             &risk_cfg, &setup_cfg, state,
                         )
                         .await;
@@ -1173,6 +1281,7 @@ fn dir_upper(d: Direction) -> &'static str {
 /// End-of-day Telegram summary (`bilore_monitor::daily_summary`): today's
 /// trades per strategy + the cumulative go-live gate. A DB error skips
 /// today's summary (logged) rather than sending a wrong one.
+#[allow(dead_code)] // MON-012: the daily summary is no longer sent; kept until removal is asked for
 async fn send_daily_summary(
     pool: &PgPool,
     http: &reqwest::Client,
@@ -1210,9 +1319,6 @@ async fn send_daily_summary(
 #[allow(clippy::too_many_arguments)]
 async fn try_globex_signal(
     pool: &PgPool,
-    http: &reqwest::Client,
-    bot_token: &str,
-    chat_id: &str,
     symbol: &str,
     setup_cfg: &TradeSetupConfig,
     price: Decimal,
@@ -1247,7 +1353,8 @@ async fn try_globex_signal(
         "🌙 <b>[V2][{}] SETUP — {symbol}</b>\nDirection : <b>{:?}</b>\nEntry     : <b>{:.2}</b> (waits for a fill)\nStop      : {:.2} (60 ticks)\nTarget    : {:.2} (2R)\nRTH POC   : {:.2} · anchor {}",
         strategy::FADE_POC_GLOBEX, setup.direction, setup.entry, setup.stop, setup.target, prior.poc, setup.anchor
     );
-    notify(http, bot_token, chat_id, &msg).await;
+    // MON-012: setups are logged, not sent to Telegram.
+    tracing::info!("{}", msg.replace("<b>", "").replace("</b>", ""));
 }
 
 /// Arm a `fade-roll-*` setup at `price` from the rolling levels (see
@@ -1256,9 +1363,6 @@ async fn try_globex_signal(
 #[allow(clippy::too_many_arguments)]
 async fn try_roll_signal(
     pool: &PgPool,
-    http: &reqwest::Client,
-    bot_token: &str,
-    chat_id: &str,
     symbol: &str,
     setup_cfg: &TradeSetupConfig,
     price: Decimal,
@@ -1293,7 +1397,8 @@ async fn try_roll_signal(
         "🔁 <b>[V2][{}] SETUP — {symbol}</b>\nDirection : <b>{:?}</b>\nEntry     : <b>{:.2}</b> (waits for a fill)\nStop      : {:.2}\nTarget    : {:.2}\nRolling   : POC {:.2} · VAH {:.2} · VAL {:.2} ({} periods) · anchor {}",
         r.cfg.slug, setup.direction, setup.entry, setup.stop, setup.target, snap.poc, snap.vah, snap.val, r.cfg.periods, setup.anchor
     );
-    notify(http, bot_token, chat_id, &msg).await;
+    // MON-012: setups are logged, not sent to Telegram.
+    tracing::info!("{}", msg.replace("<b>", "").replace("</b>", ""));
 }
 
 /// Persist + alert a pending setup cancelled by
@@ -1303,9 +1408,6 @@ async fn try_roll_signal(
 #[allow(clippy::too_many_arguments)]
 async fn report_invalidated(
     pool: &PgPool,
-    http: &reqwest::Client,
-    bot_token: &str,
-    chat_id: &str,
     symbol: &str,
     strategy_label: &str,
     ot: &OpenTrade,
@@ -1319,15 +1421,13 @@ async fn report_invalidated(
         tracing::error!("{symbol}: set_shadow_trade_v2_notes failed: {e}");
     }
     sound::play(sound::AlertKind::Expired);
-    notify(http, bot_token, chat_id, &telegram::invalidated_message(symbol, strategy_label, &ot.trade, why)).await;
+    // MON-012: logged, not sent to Telegram.
+    tracing::info!("{symbol}: [{strategy_label}] INVALIDATED — {why}");
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn try_signal(
     pool: &PgPool,
-    http: &reqwest::Client,
-    bot_token: &str,
-    chat_id: &str,
     nats: Option<&async_nats::Client>,
     symbol: &str,
     risk_cfg: &RiskConfig,
@@ -1475,7 +1575,8 @@ async fn try_signal(
         "🟢 <b>[V2][ml-model] SETUP — {symbol}</b>\nDirection : <b>{:?}</b>\nEntry     : <b>{:.2}</b>\nStop      : {:.2}\nTarget    : {:.2}\nTrust     : {:.0}% ({})",
         setup.direction, setup.entry_price, setup.stop, setup.targets[0].price, lean_risk.confidence * 100.0, lean_risk.tier_label
     );
-    notify(http, bot_token, chat_id, &msg).await;
+    // MON-012: setups are logged, not sent to Telegram.
+    tracing::info!("{}", msg.replace("<b>", "").replace("</b>", ""));
 }
 
 /// `fade-poc` strategy (2026-09-18) — same machinery as `try_signal`, with
@@ -1512,9 +1613,6 @@ async fn try_signal(
 #[allow(clippy::too_many_arguments)]
 async fn try_fade_signal(
     pool: &PgPool,
-    http: &reqwest::Client,
-    bot_token: &str,
-    chat_id: &str,
     nats: Option<&async_nats::Client>,
     symbol: &str,
     risk_cfg: &RiskConfig,
@@ -1696,7 +1794,8 @@ async fn try_fade_signal(
         setup.direction, setup.entry_price, setup.stop, setup.targets[0].price, prior_levels.poc,
         if live_price > prior_levels.poc { "above" } else { "at/below" }, trust * 100.0
     );
-    notify(http, bot_token, chat_id, &msg).await;
+    // MON-012: setups are logged, not sent to Telegram.
+    tracing::info!("{}", msg.replace("<b>", "").replace("</b>", ""));
 }
 
 async fn notify(http: &reqwest::Client, bot_token: &str, chat_id: &str, text: &str) {
@@ -1976,5 +2075,16 @@ mod tests {
         assert!(gate().may_open(ct(8, 41)).is_err(), "a block is on");
         let t = advance_open_trade(&mut slot, ts + ChronoDuration::seconds(30), d("5822.25"), d("0.25"), d("1.25"));
         assert_eq!(t, Some(shadow_trader::Transition::Lost));
+    }
+
+    // ---- MON-012 Telegram policy (2026-10-07) ----
+
+    #[test]
+    fn only_won_and_lost_results_go_to_telegram() {
+        assert!(result_goes_to_telegram(Outcome::Won));
+        assert!(result_goes_to_telegram(Outcome::Lost));
+        for o in [Outcome::Expired, Outcome::Invalidated, Outcome::Skipped, Outcome::Pending, Outcome::Entered] {
+            assert!(!result_goes_to_telegram(o), "{o:?}");
+        }
     }
 }

@@ -537,7 +537,7 @@ spec MON-010 {
 
 decision MON-011 "Manual-trading alert: one Telegram message when price leaves the value area of a normally shaped developing profile and at least 2 of structure, order flow and the other timeframe agree with the fade back toward its POC" {
   status: accepted
-  context: "User request 2026-10-07, for manual trading (not a shadow strategy, places nothing). The profile is the CURRENT session's developing volume profile (RTH from 08:30 CT, Globex from 17:00 CT). It must be a normal shape: D (bell), P or b; irregular profiles (double distribution, thin/elongated) never alert. Price above VAH means fade SHORT, below VAL fade LONG. Factors, each checked against the fade direction: structure (5-min bars of the session, pivot_n 3), order flow (session cumulative delta, directional at |delta| >= 500, the confirmation gate), and the other timeframe for that session type (bilore-core participant_view over the prior 1, 5 and 20 sessions' composite of the same type, RTH or Globex). Alert when at least 2 of the 3 agree (user: '2 or 3 align'). At most one alert per profile period (30 min RTH, 60 min Globex) unless price has crossed the POC since the last alert. The message shows the alignment and a text profile with VAH/POC/VAL and the price (user chose text over an image). Shape thresholds are initial values, to be checked against real alerts: classify only after 2 completed periods; double distribution = a second 1-point peak of at least 50% of the POC peak with a valley of at most 25% between them; elongated = value area wider than 75% of the range; D/P/b by the POC's third of the range."
+  context: "User request 2026-10-07, for manual trading (not a shadow strategy, places nothing). The profile is the CURRENT session's developing volume profile (RTH from 08:30 CT, Globex from 17:00 CT). It must be a normal shape: D (bell), P or b; irregular profiles (double distribution, thin/elongated) never alert. Price above VAH means fade SHORT, below VAL fade LONG. Factors, each checked against the fade direction: structure (5-min bars of the session, pivot_n 3), order flow (session cumulative delta, directional at |delta| >= 500, the confirmation gate), and the other timeframe for that session type (bilore-core participant_view over the prior 1, 5 and 20 sessions' composite of the same type, RTH or Globex). Alert when at least 2 of the 3 agree (user: '2 or 3 align'). At most one alert per profile period (30 min RTH, 60 min Globex) unless price has crossed the POC since the last alert. The message shows the alignment and a text profile with VAH/POC/VAL and the price (user chose text over an image). Shape thresholds (first-pass, measured 2026-10-07): classify only after 2 completed periods; double distribution = on the profile smoothed over 5 points, a second local peak of at least 40% of the main one, at least 20% of the range away, with a valley of at most half that peak between them (raw 1-point buckets were too jagged and called a normal 10-06 irregular all day); elongated = value area wider than 65% of the range (a flat profile's value area spans ~70% of it, a bell's ~40%); D/P/b by the POC's third of the range. On 16 RTH sessions about 35% of hourly snapshots read double and 15% elongated. Replayed over 2026-09-30..10-07 (Globex and RTH) it would have sent 8 alerts, about one per session."
   consequences: "+ a high-quality, rate-limited prompt for the user's own fade trades. - the other-timeframe read leans WITH price outside composite value, so at the upper value area it often disagrees with a short fade: that is the data, not a bug. - the composites come from tpo_bars, whose pre-2026-10-02 RTH rows include post-close trades. - not blocked by SYS-006's volatility block (it is information, not an entry), but the message says when a block is on. - shape thresholds are untested on real profiles."
 }
 
@@ -548,7 +548,7 @@ spec MON-011 {
     scenarios: [session_of_maps_rth_globex_and_the_gap, the_profile_restarts_at_each_session_start]
   }
   requirement MON-011-R2 (EARS) {
-    text: "WHEN the profile has at least 2 completed periods THEN it SHALL be classified D, P or b by its POC's third of the range, or Irregular when it has a double distribution or a value area wider than 75% of its range; before that it SHALL not be classified"
+    text: "WHEN the profile has at least 2 completed periods THEN it SHALL be classified D, P or b by its POC's third of the range, or Irregular when it has a double distribution or a value area wider than 65% of its range; before that it SHALL not be classified"
     layers: [unit]
     scenarios: [a_bell_shaped_profile_is_d, a_profile_with_its_poc_in_the_upper_third_is_p, a_profile_with_its_poc_in_the_lower_third_is_b, a_double_distribution_is_irregular, a_thin_elongated_profile_is_irregular, too_early_in_the_session_is_not_classified]
   }
@@ -603,13 +603,13 @@ spec MON-011 {
     # delegates: va_alert::tests::a_profile_with_its_poc_in_the_lower_third_is_b
   }
   scenario a_double_distribution_is_irregular {
-    given: "two volume peaks of similar size separated by a thin valley"
+    given: "a tall bell and a separate lower hump with a thin valley between them (value area only 50% of the range)"
     when: "classify_shape runs"
     then: "Irregular"
     # delegates: va_alert::tests::a_double_distribution_is_irregular
   }
   scenario a_thin_elongated_profile_is_irregular {
-    given: "volume spread evenly over the range (value area > 75% of it)"
+    given: "volume spread evenly over the range (value area > 65% of it)"
     when: "classify_shape runs"
     then: "Irregular"
     # delegates: va_alert::tests::a_thin_elongated_profile_is_irregular

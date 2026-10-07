@@ -132,6 +132,53 @@ pub fn volatility_over_message(symbol: &str, block: &Block) -> String {
     )
 }
 
+/// MON-011: the manual-trading value-area alert, with each factor's read
+/// and a text profile (`va_alert::render_profile`) in a monospace block.
+pub fn va_alert_message(symbol: &str, alert: &crate::va_alert::Alert, profile_text: &str) -> String {
+    use crate::va_alert::{Read, SessionKind, Shape, Side};
+    let (where_, level) = match alert.side {
+        Side::Upper => ("above VAH", alert.vah),
+        Side::Lower => ("below VAL", alert.val),
+    };
+    let shape = match alert.shape {
+        Shape::D => "D (bell)",
+        Shape::P => "P",
+        Shape::B => "b",
+        Shape::Irregular => "irregular",
+    };
+    let session = match alert.session.kind {
+        SessionKind::Rth => "RTH",
+        SessionKind::Globex => "Globex",
+    };
+    let period = (b'A' + alert.period.min(25) as u8) as char;
+    let read = |r: Read| match r {
+        Read::Agree => "✅ agrees",
+        Read::Disagree => "❌ against",
+        Read::Neutral => "➖ neutral",
+    };
+    format!(
+        "📊 <b>[V2] VALUE AREA — {symbol}</b>\n\
+         Price <b>{:.2}</b> {where_} {:.2} → <b>fade {}</b>\n\
+         Shape: {shape} · {session} period {period} · <b>{}/3 aligned</b>\n\
+         Structure       {}\n\
+         Order flow      {} (Δ {})\n\
+         Other timeframe {}\n\
+         VAH {:.2} · POC {:.2} · VAL {:.2}\n\
+         <pre>{profile_text}</pre>",
+        alert.price,
+        level,
+        direction_str(alert.fade),
+        alert.agreeing(),
+        read(alert.structure),
+        read(alert.order_flow),
+        alert.delta,
+        read(alert.otf),
+        alert.vah,
+        alert.poc,
+        alert.val,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +298,30 @@ mod tests {
         assert!(msg.contains("[V2] VOLATILITY OVER — MESZ6"), "{msg}");
         assert!(msg.contains("New setups allowed again"), "{msg}");
         assert!(msg.contains("was: Globex reopen"), "{msg}");
+    }
+
+    #[test]
+    fn va_alert_message_shows_alignment_and_profile() {
+        use crate::va_alert::{Alert, Read, SessionId, SessionKind, Shape, Side};
+        let d = |s: &str| s.parse::<Decimal>().unwrap();
+        let alert = Alert {
+            session: SessionId { kind: SessionKind::Rth, start: ct(8, 30) },
+            period: 3,
+            side: Side::Upper,
+            fade: Direction::Short,
+            shape: Shape::P,
+            structure: Read::Agree,
+            order_flow: Read::Agree,
+            otf: Read::Disagree,
+            delta: -812,
+            price: d("5009.25"),
+            poc: d("5005.00"),
+            vah: d("5007.00"),
+            val: d("5004.00"),
+        };
+        let msg = va_alert_message("MESZ6", &alert, "5010.00 ██ \n5009.00 ███ ◀ 5009.25");
+        for want in ["[V2] VALUE AREA — MESZ6", "above VAH", "fade SHORT", "Shape: P", "2/3 aligned", "Structure", "Order flow", "Δ -812", "Other timeframe", "RTH", "<pre>", "5009.00 ███ ◀ 5009.25"] {
+            assert!(msg.contains(want), "missing {want:?} in\n{msg}");
+        }
     }
 }

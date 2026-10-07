@@ -353,3 +353,41 @@ pub async fn fetch_range_samples(
         .map(|(at, range)| bilore_core::volatility::RangeSample { session: at.date(), at, range })
         .collect())
 }
+
+/// MON-011 other-timeframe composite: POC/VAH/VAL of `symbol`'s last `n`
+/// trading dates in `tpo_bars` strictly before `before` (`MESZ6` for RTH,
+/// `MESZ6-GLOBEX` for Globex) — the prior day, week and month for n = 1,
+/// 5, 20. Same query as bilore-cockpit's composite loader, minus the
+/// current session. `None` when there is no history yet.
+pub async fn fetch_composite_profile(
+    pool: &PgPool,
+    symbol: &str,
+    before: NaiveDate,
+    n: i64,
+) -> Result<Option<bilore_core::inventory::ReferenceProfile>> {
+    let rows: Vec<(NaiveDate, String, String, Decimal, i64, i32)> = sqlx::query_as(
+        "SELECT date, symbol, period, price, volume, trade_count FROM tpo_bars \
+         WHERE symbol = $1 AND date IN ( \
+           SELECT DISTINCT date FROM tpo_bars WHERE symbol = $1 AND date < $2 ORDER BY date DESC LIMIT $3)",
+    )
+    .bind(symbol)
+    .bind(before)
+    .bind(n)
+    .fetch_all(pool)
+    .await?;
+    let entries: Vec<tpo_builder::profile::TpoEntry> = rows
+        .into_iter()
+        .filter_map(|(date, symbol, period, price, volume, count)| {
+            Some(tpo_builder::profile::TpoEntry {
+                date,
+                symbol,
+                period: period.chars().next()?,
+                price,
+                volume: volume.max(0) as u64,
+                count: count.max(0) as u32,
+            })
+        })
+        .collect();
+    Ok(tpo_builder::profile::compute_metrics(&entries)
+        .map(|m| bilore_core::inventory::ReferenceProfile { poc: m.poc, vah: m.vah, val: m.val }))
+}

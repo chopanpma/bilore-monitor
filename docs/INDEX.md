@@ -18,6 +18,7 @@ via `git config core.hooksPath .githooks`). `db.rs` (DB I/O) and `main.rs`
 | `levels.rs` | done (2026-10-02 — prior RTH levels from ticks) | [levels.md](levels.md) |
 | `rolling.rs` | done (2026-10-02 — `fade-roll-*`, user style with rolling levels) | [rolling.md](rolling.md) |
 | `vol_gate.rs` | done (2026-10-04 — volatility gate, bilore-specs SYS-006) | [vol_gate.md](vol_gate.md) |
+| `va_alert.rs` | done (2026-10-07 — value-area alert for manual trading, MON-011) | [va_alert.md](va_alert.md) |
 | `bin/repair_session_profiles.rs` | one-off data repair (2026-10-02) | [repair_session_profiles.md](repair_session_profiles.md) |
 | `db.rs` | exempt (I/O) | — |
 | `main.rs` | exempt (wiring) | — |

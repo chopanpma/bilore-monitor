@@ -26,9 +26,14 @@ flowchart LR
 | `result_message()` | Won/Lost/Expired icon + entry/exit + entry trust (`Trust: NN%` — the 0..1 score captured at lock time, same value persisted to `shadow_trades_v2.confidence`; semantics per strategy, contracts/strategies.md "Trust metric") + PnL | `result_message_shows_won_outcome_and_pnl`, `result_message_shows_lost_outcome` |
 | `volatility_started_message()` | ⚠️ `[V2] VOLATILITY` — no new setups: reason (release name / RTH open / Globex reopen / spike Nx the normal 30-second move) and until when (bilore-specs SYS-006, 2026-10-04) | `volatility_message_names_the_reason_and_when_it_ends` |
 | `volatility_over_message()` | ✅ `[V2] VOLATILITY OVER` — new setups allowed again, naming what ended | `volatility_over_message_says_setups_are_allowed_again` |
+| `va_alert_message()` | 📊 `[V2] VALUE AREA` — side, fade direction, shape, period, each factor's read (✅/❌/➖), VAH/POC/VAL and the text profile in `<pre>` (MON-011, 2026-10-07) | `va_alert_message_shows_alignment_and_profile` |
 | `send()` | POSTs to the Telegram Bot API, HTML parse mode (matches v1's convention) | not tested — network I/O |
 
 ## Known deviations / scope notes
+
+- **Since 2026-10-07 (MON-012) only won/lost results and the value-area alert are
+  sent.** Setup, invalidated and expired messages, the volatility notices and the daily
+  summary are built but logged, not sent; their builders stay tested.
 
 - Not a port of `telegram_notify.py` — that file has ~10 message types
   (setup, zone alert, shadow result, daily summary, family broadcast...);
