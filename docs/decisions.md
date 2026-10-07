@@ -220,7 +220,9 @@ sequenceDiagram
 
 ## MON-008 — A daily Telegram summary is sent once per weekday in the hour after the 15:00 CT close, per strategy, with the same gate code as bilore-backtest-gate
 
-**Status:** accepted
+**Status:** superseded
+
+**Superseded by:** `MON-012`
 
 **Context:** User request 2026-09-28. Due 15:00-16:00 CT on the Chicago wall clock (survives DST); a late restart sends nothing stale. Per strategy: today's and this week's (Monday..today) trades, win rate, P&L, and the cumulative go-live gate line computed with bilore_backtest::gate so the two reports can never disagree.
 
@@ -283,16 +285,80 @@ sequenceDiagram
 
 | ID | Requirement |
 | --- | --- |
-| MON-010-R1 | WHEN a setup or result message is built THEN it SHALL start with [V2] and name the symbol, direction and prices |
+| MON-010-R1 | WHEN a shadow-trade result message is built THEN it SHALL start with [V2] and name the strategy, symbol, direction, prices and P&L |
 | MON-010-R2 | WHEN an alert sound is chosen THEN it SHALL be distinct per alert kind and never one of v1's Funk, Glass, Hero or Ping |
 
 ### Scenarios
 
 | ID | Requirement | Layer | Scenario |
 | --- | --- | --- | --- |
-| setup_message_includes_symbol_direction_and_prices | MON-010-R1 | unit | Given a Long MESU6 signal at 5000 / stop 4995 / target 5010, when telegram::setup_message runs, then it contains '[V2] SETUP — MESU6', LONG and the three prices. |
 | result_message_shows_won_outcome_and_pnl | MON-010-R1 | unit | Given a Won trade, when the result message is built, then it shows the outcome and P&L. |
-| invalidated_message_names_the_setup_and_why_it_was_cancelled | MON-010-R1 | unit | Given an invalidated setup, when the invalidated message is built, then it names the setup and the reason. |
+| result_message_shows_lost_outcome | MON-010-R1 | unit | Given a Lost trade, when the result message is built, then it shows the Lost outcome. |
 | no_sound_here_overlaps_v1s_set | MON-010-R2 | unit | Given every v2 AlertKind, when sounds_for runs, then no path ends in Funk, Glass, Hero or Ping .aiff. |
 | every_alert_kind_maps_to_a_distinct_primary_sound | MON-010-R2 | unit | Given every AlertKind, when sounds_for runs, then each kind's primary sound differs. |
+
+## MON-011 — Manual-trading alert: one Telegram message when price leaves the value area of a normally shaped developing profile and at least 2 of structure, order flow and the other timeframe agree with the fade back toward its POC
+
+**Status:** accepted
+
+**Context:** User request 2026-10-07, for manual trading (not a shadow strategy, places nothing). The profile is the CURRENT session's developing volume profile (RTH from 08:30 CT, Globex from 17:00 CT). It must be a normal shape: D (bell), P or b; irregular profiles (double distribution, thin/elongated) never alert. Price above VAH means fade SHORT, below VAL fade LONG. Factors, each checked against the fade direction: structure (5-min bars of the session, pivot_n 3), order flow (session cumulative delta, directional at |delta| >= 500, the confirmation gate), and the other timeframe for that session type (bilore-core participant_view over the prior 1, 5 and 20 sessions' composite of the same type, RTH or Globex). Alert when at least 2 of the 3 agree (user: '2 or 3 align'). At most one alert per profile period (30 min RTH, 60 min Globex) unless price has crossed the POC since the last alert. The message shows the alignment and a text profile with VAH/POC/VAL and the price (user chose text over an image). Shape thresholds are initial values, to be checked against real alerts: classify only after 2 completed periods; double distribution = a second 1-point peak of at least 50% of the POC peak with a valley of at most 25% between them; elongated = value area wider than 75% of the range; D/P/b by the POC's third of the range.
+
+**Consequences:** + a high-quality, rate-limited prompt for the user's own fade trades. - the other-timeframe read leans WITH price outside composite value, so at the upper value area it often disagrees with a short fade: that is the data, not a bug. - the composites come from tpo_bars, whose pre-2026-10-02 RTH rows include post-close trades. - not blocked by SYS-006's volatility block (it is information, not an entry), but the message says when a block is on. - shape thresholds are untested on real profiles.
+
+### Requirements
+
+| ID | Requirement |
+| --- | --- |
+| MON-011-R1 | WHEN the monitor receives a live trade THEN it SHALL add it to the developing profile of its session, RTH 08:30-15:00 CT or Globex 17:00-08:30 CT, which restarts empty at each session start; trades between 15:00 and 17:00 CT belong to no session |
+| MON-011-R2 | WHEN the profile has at least 2 completed periods THEN it SHALL be classified D, P or b by its POC's third of the range, or Irregular when it has a double distribution or a value area wider than 75% of its range; before that it SHALL not be classified |
+| MON-011-R3 | WHEN price is above VAH or below VAL of a D, P or b profile THEN the fade direction SHALL be SHORT or LONG respectively; inside the value area or on an irregular profile there SHALL be no alert |
+| MON-011-R4 | WHEN at least 2 of structure, order flow and the other timeframe agree with the fade direction THEN the alert SHALL fire; a neutral or unavailable factor SHALL not count |
+| MON-011-R5 | WHEN an alert was sent in the current profile period THEN no other SHALL be sent in that period unless price has crossed the POC since; a new period SHALL allow a new alert |
+| MON-011-R6 | WHEN the alert is sent THEN the message SHALL show the side, fade direction, shape, each factor's read, VAH/POC/VAL and a text profile of at most 24 rows marking VAH, POC, VAL and the price |
+
+### Scenarios
+
+| ID | Requirement | Layer | Scenario |
+| --- | --- | --- | --- |
+| session_of_maps_rth_globex_and_the_gap | MON-011-R1 | unit | Given Monday 08:30, 14:59, 15:00, 16:59, 17:00 and Tuesday 02:00 CT, and Saturday noon, when va_alert::session_of runs, then RTH, RTH, none, none, Globex (Monday 17:00), the same Globex session, none. |
+| the_profile_restarts_at_each_session_start | MON-011-R1 | unit | Given RTH trades on Monday, then a Globex trade at 17:00, when the developing profile is read after the Globex trade, then it holds only the Globex trade. |
+| a_bell_shaped_profile_is_d | MON-011-R2 | unit | Given a symmetric profile with its POC mid-range, when classify_shape runs, then D. |
+| a_profile_with_its_poc_in_the_upper_third_is_p | MON-011-R2 | unit | Given volume concentrated near the top with a thin lower tail, when classify_shape runs, then P. |
+| a_profile_with_its_poc_in_the_lower_third_is_b | MON-011-R2 | unit | Given volume concentrated near the bottom with a thin upper tail, when classify_shape runs, then b. |
+| a_double_distribution_is_irregular | MON-011-R2 | unit | Given two volume peaks of similar size separated by a thin valley, when classify_shape runs, then Irregular. |
+| a_thin_elongated_profile_is_irregular | MON-011-R2 | unit | Given volume spread evenly over the range (value area > 75% of it), when classify_shape runs, then Irregular. |
+| too_early_in_the_session_is_not_classified | MON-011-R2 | unit | Given a bell-shaped profile with only 1 completed period, when the alert is evaluated, then no shape and no alert. |
+| price_above_vah_fades_short | MON-011-R3 | unit | Given a D profile and price above VAH with 2 factors agreeing SHORT, when evaluate runs, then an Upper alert fading SHORT. |
+| price_below_val_fades_long | MON-011-R3 | unit | Given a D profile and price below VAL with 2 factors agreeing LONG, when evaluate runs, then a Lower alert fading LONG. |
+| price_inside_the_value_area_never_alerts | MON-011-R3 | unit | Given a D profile, price between VAL and VAH, all factors agreeing, when evaluate runs, then no alert. |
+| an_irregular_profile_never_alerts | MON-011-R3 | unit | Given a double distribution with price above VAH and all factors agreeing, when evaluate runs, then no alert. |
+| two_of_three_agreeing_with_the_fade_alerts | MON-011-R4 | unit | Given price above VAH, structure bearish, delta -800, other timeframe leaning Long, when evaluate runs, then an alert with 2 of 3 agreeing. |
+| one_of_three_does_not_alert | MON-011-R4 | unit | Given price above VAH, structure bearish, delta +800, other timeframe leaning Long, when evaluate runs, then no alert. |
+| neutral_factors_do_not_count | MON-011-R4 | unit | Given price above VAH, structure bearish, delta -300 (under the gate), no composite, when evaluate runs, then no alert: only 1 factor agrees. |
+| one_alert_per_period | MON-011-R5 | unit | Given an alert sent in RTH period C, when the conditions hold again later in period C without a POC cross, then nothing is sent. |
+| a_poc_cross_re_arms_within_the_period | MON-011-R5 | unit | Given an alert sent above VAH in period C, then price trades through the POC, when price goes back above VAH in period C with the conditions met, then a second alert is sent. |
+| a_new_period_re_arms | MON-011-R5 | unit | Given an alert sent in period C, when the conditions hold in period D, then a new alert is sent. |
+| the_text_profile_marks_vah_poc_val_and_price | MON-011-R6 | unit | Given a profile with VAH, POC, VAL and price on different rows, when render_profile runs, then the rows carry VAH, POC, VAL markers and the price arrow, highest price first. |
+| the_text_profile_fits_in_24_rows | MON-011-R6 | unit | Given a 60-point range at 0.25 ticks (240 levels), when render_profile runs, then it uses at most 24 rows. |
+| va_alert_message_shows_alignment_and_profile | MON-011-R6 | unit | Given an Upper SHORT alert on a P profile with structure and order flow agreeing, when telegram::va_alert_message runs, then it shows '[V2] VALUE AREA — MESZ6', 'above VAH', 'fade SHORT', 'P', 2/3 aligned, each factor and the profile block. |
+
+## MON-012 — Telegram carries only won/lost shadow-trade results and the value-area alert
+
+**Status:** accepted
+
+**Context:** User, 2026-10-07: remove the useless Telegram alerts. Setup, invalidated and expired messages, the volatility block notices (SYS-006, now logged only) and the daily summary (MON-008) are no longer sent; sounds stay. v1's bilore_session.py alerts are untouched.
+
+**Consequences:** + a quiet chat where every message is a finished trade or a manual-trading prompt. - pending setups and volatility blocks are visible only in the logs and the cockpit. - the daily summary code stays in the repo, unused, until removed on request.
+
+### Requirements
+
+| ID | Requirement |
+| --- | --- |
+| MON-012-R1 | WHEN a shadow trade ends THEN its result SHALL go to Telegram only if it is Won or Lost |
+
+### Scenarios
+
+| ID | Requirement | Layer | Scenario |
+| --- | --- | --- | --- |
+| only_won_and_lost_results_go_to_telegram | MON-012-R1 | unit | Given trades ending Won, Lost, Expired, Invalidated and Skipped, when result_goes_to_telegram runs for each, then true for Won and Lost only. |
 

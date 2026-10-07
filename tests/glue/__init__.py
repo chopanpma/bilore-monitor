@@ -250,16 +250,8 @@ def unrecognized_root_falls_back_to_mes_economics():
 
 # --- MON-010 ---------------------------------------------------------------
 
-def setup_message_includes_symbol_direction_and_prices():
-    _delegate('telegram::tests::setup_message_includes_symbol_direction_and_prices')
-
-
 def result_message_shows_won_outcome_and_pnl():
     _delegate('telegram::tests::result_message_shows_won_outcome_and_pnl')
-
-
-def invalidated_message_names_the_setup_and_why_it_was_cancelled():
-    _delegate('telegram::tests::invalidated_message_names_the_setup_and_why_it_was_cancelled')
 
 
 def no_sound_here_overlaps_v1s_set():
@@ -268,3 +260,101 @@ def no_sound_here_overlaps_v1s_set():
 
 def every_alert_kind_maps_to_a_distinct_primary_sound():
     _delegate('sound::tests::every_alert_kind_maps_to_a_distinct_primary_sound')
+
+
+# --- MON-011 (value-area alert, 2026-10-07) ---------------------------------
+
+
+def session_of_maps_rth_globex_and_the_gap():
+    _delegate('va_alert::tests::session_of_maps_rth_globex_and_the_gap')
+
+
+def the_profile_restarts_at_each_session_start():
+    _delegate('va_alert::tests::the_profile_restarts_at_each_session_start')
+
+
+def a_bell_shaped_profile_is_d():
+    _delegate('va_alert::tests::a_bell_shaped_profile_is_d')
+
+
+def a_profile_with_its_poc_in_the_upper_third_is_p():
+    _delegate('va_alert::tests::a_profile_with_its_poc_in_the_upper_third_is_p')
+
+
+def a_profile_with_its_poc_in_the_lower_third_is_b():
+    _delegate('va_alert::tests::a_profile_with_its_poc_in_the_lower_third_is_b')
+
+
+def a_double_distribution_is_irregular():
+    _delegate('va_alert::tests::a_double_distribution_is_irregular')
+
+
+def a_thin_elongated_profile_is_irregular():
+    _delegate('va_alert::tests::a_thin_elongated_profile_is_irregular')
+
+
+def too_early_in_the_session_is_not_classified():
+    _delegate('va_alert::tests::too_early_in_the_session_is_not_classified')
+
+
+def price_above_vah_fades_short():
+    _delegate('va_alert::tests::price_above_vah_fades_short')
+
+
+def price_below_val_fades_long():
+    _delegate('va_alert::tests::price_below_val_fades_long')
+
+
+def price_inside_the_value_area_never_alerts():
+    _delegate('va_alert::tests::price_inside_the_value_area_never_alerts')
+
+
+def an_irregular_profile_never_alerts():
+    _delegate('va_alert::tests::an_irregular_profile_never_alerts')
+
+
+def two_of_three_agreeing_with_the_fade_alerts():
+    _delegate('va_alert::tests::two_of_three_agreeing_with_the_fade_alerts')
+
+
+def one_of_three_does_not_alert():
+    _delegate('va_alert::tests::one_of_three_does_not_alert')
+
+
+def neutral_factors_do_not_count():
+    _delegate('va_alert::tests::neutral_factors_do_not_count')
+
+
+def one_alert_per_period():
+    _delegate('va_alert::tests::one_alert_per_period')
+
+
+def a_poc_cross_re_arms_within_the_period():
+    _delegate('va_alert::tests::a_poc_cross_re_arms_within_the_period')
+
+
+def a_new_period_re_arms():
+    _delegate('va_alert::tests::a_new_period_re_arms')
+
+
+def the_text_profile_marks_vah_poc_val_and_price():
+    _delegate('va_alert::tests::the_text_profile_marks_vah_poc_val_and_price')
+
+
+def the_text_profile_fits_in_24_rows():
+    _delegate('va_alert::tests::the_text_profile_fits_in_24_rows')
+
+
+def va_alert_message_shows_alignment_and_profile():
+    _delegate('telegram::tests::va_alert_message_shows_alignment_and_profile')
+
+
+def result_message_shows_lost_outcome():
+    _delegate('telegram::tests::result_message_shows_lost_outcome')
+
+
+# --- MON-012 (Telegram policy) -------------------------------------------------
+
+
+def only_won_and_lost_results_go_to_telegram():
+    _delegate('tests::only_won_and_lost_results_go_to_telegram', target=('--bin', 'bilore-monitor'))
