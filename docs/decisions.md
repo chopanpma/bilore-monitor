@@ -220,11 +220,9 @@ sequenceDiagram
 
 ## MON-008 — A daily Telegram summary is sent once per weekday in the hour after the 15:00 CT close, per strategy, with the same gate code as bilore-backtest-gate
 
-**Status:** superseded
+**Status:** accepted
 
-**Superseded by:** `MON-012`
-
-**Context:** User request 2026-09-28. Due 15:00-16:00 CT on the Chicago wall clock (survives DST); a late restart sends nothing stale. Per strategy: today's and this week's (Monday..today) trades, win rate, P&L, and the cumulative go-live gate line computed with bilore_backtest::gate so the two reports can never disagree.
+**Context:** User request 2026-09-28; switched off 2026-10-07 (MON-012) and back on 2026-10-08 at the user's request, as the one alert besides won/lost results and the value-area alert. Due 15:00-16:00 CT on the Chicago wall clock (survives DST); a late restart sends nothing stale. Per strategy: today's and this week's (Monday..today) trades, win rate, P&L, and the cumulative go-live gate line computed with bilore_backtest::gate so the two reports can never disagree.
 
 **Consequences:** + one glance per day at every scoreboard. - a monitor down for the whole hour skips that day's summary.
 
@@ -234,6 +232,7 @@ sequenceDiagram
 | --- | --- |
 | MON-008-R1 | WHEN the Chicago time is between 15:00 and 16:00 on a weekday and today's summary was not sent THEN summary_due SHALL return today; otherwise None |
 | MON-008-R2 | WHEN the summary is built THEN each strategy SHALL show today's rows, Monday-to-today rows and the cumulative gate line |
+| MON-008-R3 | WHEN bilore-monitor is started with --send-summary [YYYY-MM-DD] THEN it SHALL send that day's summary (today when no date is given) once and exit, and SHALL refuse an unreadable date |
 
 ### Scenarios
 
@@ -249,6 +248,7 @@ sequenceDiagram
 | week_line_covers_monday_through_today_and_excludes_last_week | MON-008-R2 | unit | Given rows from this week and last week, when the week line is built, then only Monday through today count. |
 | total_line_shows_the_cumulative_gate | MON-008-R2 | unit | Given a strategy's resolved history, when the summary is built, then the total line shows the gate result. |
 | a_strategy_with_no_trades_says_so_for_today_and_week | MON-008-R2 | unit | Given a strategy with no rows, when the summary is built, then today and week say no trades. |
+| send_summary_flag_picks_the_day | MON-008-R3 | unit | Given arguments --send-summary 2026-10-07, --send-summary alone, no flag, and --send-summary 10/07, when summary_request parses them on 2026-10-08, then 2026-10-07, 2026-10-08, none, and an error. |
 
 ## MON-009 — Tick size and value come from the contract root's real CME spec; an unrecognized root falls back to MES
 
@@ -342,13 +342,13 @@ sequenceDiagram
 | the_text_profile_fits_in_24_rows | MON-011-R6 | unit | Given a 60-point range at 0.25 ticks (240 levels), when render_profile runs, then it uses at most 24 rows. |
 | va_alert_message_shows_alignment_and_profile | MON-011-R6 | unit | Given an Upper SHORT alert on a P profile with structure and order flow agreeing, when telegram::va_alert_message runs, then it shows '[V2] VALUE AREA — MESZ6', 'above VAH', 'fade SHORT', 'P', 2/3 aligned, each factor and the profile block. |
 
-## MON-012 — Telegram carries only won/lost shadow-trade results and the value-area alert
+## MON-012 — Telegram carries only won/lost shadow-trade results, the value-area alert and the daily summary
 
 **Status:** accepted
 
-**Context:** User, 2026-10-07: remove the useless Telegram alerts. Setup, invalidated and expired messages, the volatility block notices (SYS-006, now logged only) and the daily summary (MON-008) are no longer sent; sounds stay. v1's bilore_session.py alerts are untouched.
+**Context:** User, 2026-10-07: remove the useless Telegram alerts. Setup, invalidated and expired messages, the volatility block notices (SYS-006, now logged only) are no longer sent. The daily summary (MON-008) was switched off too and turned back on 2026-10-08 at the user's request. v1 sends nothing (bilore-ml BML-006); only the value-area alert has a sound (MON-013).
 
-**Consequences:** + a quiet chat where every message is a finished trade or a manual-trading prompt. - pending setups and volatility blocks are visible only in the logs and the cockpit. - the daily summary code stays in the repo, unused, until removed on request.
+**Consequences:** + a quiet chat where every message is a finished trade or a manual-trading prompt. - pending setups and volatility blocks are visible only in the logs and the cockpit. + one end-of-day scoreboard per weekday.
 
 ### Requirements
 

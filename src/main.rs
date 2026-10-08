@@ -262,6 +262,18 @@ fn result_goes_to_telegram(outcome: Outcome) -> bool {
     matches!(outcome, Outcome::Won | Outcome::Lost)
 }
 
+/// MON-008-R3: `--send-summary [YYYY-MM-DD]` sends that day's summary (today
+/// without a date) and exits. `Ok(None)` without the flag.
+fn summary_request(args: &[String], today: NaiveDate) -> std::result::Result<Option<NaiveDate>, String> {
+    let Some(i) = args.iter().position(|a| a == "--send-summary") else { return Ok(None) };
+    match args.get(i + 1).filter(|a| !a.starts_with("--")) {
+        None => Ok(Some(today)),
+        Some(day) => NaiveDate::parse_from_str(day, "%Y-%m-%d")
+            .map(Some)
+            .map_err(|e| format!("--send-summary {day}: expected YYYY-MM-DD ({e})")),
+    }
+}
+
 struct TrainedModel {
     models: Vec<LogisticModel>, // [p_bullish, p_break_vah, p_break_val, p_return_poc]
     quality: ModelQuality,
@@ -742,6 +754,26 @@ async fn main() -> Result<()> {
     let pool = PgPoolOptions::new().max_connections(3 + registered.len() as u32).connect(&db_url).await?;
     let http = reqwest::Client::new();
 
+    // Summary scope = roots of the symbols this process trades (SYMBOLS),
+    // so it follows the MES-only decision (2026-09-29) automatically.
+    let summary_root_names: Vec<String> = {
+        let mut r: Vec<String> =
+            registered.iter().filter_map(|s| bilore_core::instrument::futures_root(s)).map(str::to_string).collect();
+        r.sort();
+        r.dedup();
+        r
+    };
+    let summary_roots: Vec<&str> = summary_root_names.iter().map(String::as_str).collect();
+
+    // MON-008-R3: `bilore-monitor --send-summary [YYYY-MM-DD]` sends one
+    // summary and exits, without starting the monitor.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(day) = summary_request(&args, Utc::now().with_timezone(&Chicago).date_naive()).map_err(anyhow::Error::msg)? {
+        send_daily_summary(&pool, &http, &bot_token, &chat_id, day, &summary_roots).await;
+        tracing::info!("daily summary for {day} sent on request");
+        return Ok(());
+    }
+
     let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
     let nats = match async_nats::connect(&nats_url).await {
         Ok(nc) => Some(nc),
@@ -785,8 +817,7 @@ async fn main() -> Result<()> {
 
     let mut last_pending_retry = Utc::now();
     // In-memory only: a restart inside the 15:00–16:00 CT window re-sends.
-    // Summary scope = roots of the symbols this process trades (SYMBOLS),
-    // so it follows the MES-only decision (2026-09-29) automatically.
+    let mut last_summary: Option<NaiveDate> = None;
     // SYS-006 news calendar: refreshed every 15 min (the feed rate-limits
     // bursts). A failed fetch keeps the last good week; until the first
     // success every gate runs without releases (entries continue, warned).
@@ -810,6 +841,12 @@ async fn main() -> Result<()> {
     let mut tick_interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         tick_interval.tick().await;
+
+        // MON-008 (back on 2026-10-08): weekdays 15:00-16:00 CT.
+        if let Some(day) = daily_summary::summary_due(Utc::now(), last_summary) {
+            last_summary = Some(day);
+            send_daily_summary(&pool, &http, &bot_token, &chat_id, day, &summary_roots).await;
+        }
 
         if cal_rx.has_changed().unwrap_or(false) {
             let cal = cal_rx.borrow_and_update().clone();
@@ -1282,7 +1319,6 @@ fn dir_upper(d: Direction) -> &'static str {
 /// End-of-day Telegram summary (`bilore_monitor::daily_summary`): today's
 /// trades per strategy + the cumulative go-live gate. A DB error skips
 /// today's summary (logged) rather than sending a wrong one.
-#[allow(dead_code)] // MON-012: the daily summary is no longer sent; kept until removal is asked for
 async fn send_daily_summary(
     pool: &PgPool,
     http: &reqwest::Client,
@@ -2087,5 +2123,17 @@ mod tests {
         for o in [Outcome::Expired, Outcome::Invalidated, Outcome::Skipped, Outcome::Pending, Outcome::Entered] {
             assert!(!result_goes_to_telegram(o), "{o:?}");
         }
+    }
+
+    // ---- MON-008-R3: one-shot daily summary ----
+
+    #[test]
+    fn send_summary_flag_picks_the_day() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+        assert_eq!(summary_request(&args(&["bilore-monitor", "--send-summary", "2026-10-07"]), today), Ok(NaiveDate::from_ymd_opt(2026, 10, 7)));
+        assert_eq!(summary_request(&args(&["bilore-monitor", "--send-summary"]), today), Ok(Some(today)));
+        assert_eq!(summary_request(&args(&["bilore-monitor"]), today), Ok(None));
+        assert!(summary_request(&args(&["bilore-monitor", "--send-summary", "10/07"]), today).is_err());
     }
 }

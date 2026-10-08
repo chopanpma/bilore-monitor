@@ -375,9 +375,8 @@ spec MON-007 {
 }
 
 decision MON-008 "A daily Telegram summary is sent once per weekday in the hour after the 15:00 CT close, per strategy, with the same gate code as bilore-backtest-gate" {
-  status: superseded
-  superseded_by: MON-012
-  context: "User request 2026-09-28. Due 15:00-16:00 CT on the Chicago wall clock (survives DST); a late restart sends nothing stale. Per strategy: today's and this week's (Monday..today) trades, win rate, P&L, and the cumulative go-live gate line computed with bilore_backtest::gate so the two reports can never disagree."
+  status: accepted
+  context: "User request 2026-09-28; switched off 2026-10-07 (MON-012) and back on 2026-10-08 at the user's request, as the one alert besides won/lost results and the value-area alert. Due 15:00-16:00 CT on the Chicago wall clock (survives DST); a late restart sends nothing stale. Per strategy: today's and this week's (Monday..today) trades, win rate, P&L, and the cumulative go-live gate line computed with bilore_backtest::gate so the two reports can never disagree."
   consequences: "+ one glance per day at every scoreboard. - a monitor down for the whole hour skips that day's summary."
 }
 
@@ -391,6 +390,17 @@ spec MON-008 {
     text: "WHEN the summary is built THEN each strategy SHALL show today's rows, Monday-to-today rows and the cumulative gate line"
     layers: [unit]
     scenarios: [today_line_counts_only_todays_rows, week_line_covers_monday_through_today_and_excludes_last_week, total_line_shows_the_cumulative_gate, a_strategy_with_no_trades_says_so_for_today_and_week]
+  }
+  requirement MON-008-R3 (EARS) {
+    text: "WHEN bilore-monitor is started with --send-summary [YYYY-MM-DD] THEN it SHALL send that day's summary (today when no date is given) once and exit, and SHALL refuse an unreadable date"
+    layers: [unit]
+    scenarios: [send_summary_flag_picks_the_day]
+  }
+  scenario send_summary_flag_picks_the_day {
+    given: "arguments --send-summary 2026-10-07, --send-summary alone, no flag, and --send-summary 10/07"
+    when: "summary_request parses them on 2026-10-08"
+    then: "2026-10-07, 2026-10-08, none, and an error"
+    # delegates: --bin bilore-monitor tests::send_summary_flag_picks_the_day
   }
   scenario due_right_at_the_rth_close_on_a_weekday {
     given: "Monday 2026-09-28 15:00 CT, nothing sent"
@@ -700,10 +710,10 @@ spec MON-011 {
   }
 }
 
-decision MON-012 "Telegram carries only won/lost shadow-trade results and the value-area alert" {
+decision MON-012 "Telegram carries only won/lost shadow-trade results, the value-area alert and the daily summary" {
   status: accepted
-  context: "User, 2026-10-07: remove the useless Telegram alerts. Setup, invalidated and expired messages, the volatility block notices (SYS-006, now logged only) and the daily summary (MON-008) are no longer sent; sounds stay. v1's bilore_session.py alerts are untouched."
-  consequences: "+ a quiet chat where every message is a finished trade or a manual-trading prompt. - pending setups and volatility blocks are visible only in the logs and the cockpit. - the daily summary code stays in the repo, unused, until removed on request."
+  context: "User, 2026-10-07: remove the useless Telegram alerts. Setup, invalidated and expired messages, the volatility block notices (SYS-006, now logged only) are no longer sent. The daily summary (MON-008) was switched off too and turned back on 2026-10-08 at the user's request. v1 sends nothing (bilore-ml BML-006); only the value-area alert has a sound (MON-013)."
+  consequences: "+ a quiet chat where every message is a finished trade or a manual-trading prompt. - pending setups and volatility blocks are visible only in the logs and the cockpit. + one end-of-day scoreboard per weekday."
 }
 
 spec MON-012 {

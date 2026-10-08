@@ -31,9 +31,10 @@ flowchart LR
 
 ## Known deviations / scope notes
 
-- **Since 2026-10-07 (MON-012) only won/lost results and the value-area alert are
-  sent.** Setup, invalidated and expired messages, the volatility notices and the daily
-  summary are built but logged, not sent; their builders stay tested.
+- **Since 2026-10-07 (MON-012) only won/lost results, the value-area alert and (from
+  2026-10-08, MON-008) the daily summary are sent.** Setup, invalidated and expired
+  messages and the volatility notices are built but logged, not sent; their builders stay
+  tested. One summary on demand: `bilore-monitor --send-summary [YYYY-MM-DD]`.
 
 - Not a port of `telegram_notify.py` — that file has ~10 message types
   (setup, zone alert, shadow result, daily summary, family broadcast...);

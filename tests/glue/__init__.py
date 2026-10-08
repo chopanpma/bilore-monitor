@@ -368,3 +368,7 @@ def only_the_value_area_alert_makes_a_sound():
 
 def the_value_area_sound_is_distinct_from_v1_and_the_cockpit():
     _delegate('sound::tests::the_value_area_sound_is_distinct_from_v1_and_the_cockpit')
+
+
+def send_summary_flag_picks_the_day():
+    _delegate('tests::send_summary_flag_picks_the_day', target=('--bin', 'bilore-monitor'))
