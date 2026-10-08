@@ -22,16 +22,24 @@ pub enum AlertKind {
     Won,
     Lost,
     Expired,
+    /// MON-011 value-area alert — the only kind that plays (MON-013).
+    ValueArea,
+}
+
+/// MON-013 (user, 2026-10-07): only the value-area alert makes a sound.
+pub fn enabled(kind: AlertKind) -> bool {
+    matches!(kind, AlertKind::ValueArea)
 }
 
 /// Primary + fallback sound for each alert kind — none of these overlap
 /// with v1's set (Funk, Glass, Hero, Ping).
 fn sounds_for(kind: AlertKind) -> [&'static str; 2] {
     match kind {
-        AlertKind::Setup => ["/System/Library/Sounds/Sosumi.aiff", "/System/Library/Sounds/Pop.aiff"],
+        AlertKind::Setup => ["/System/Library/Sounds/Pop.aiff", "/System/Library/Sounds/Sosumi.aiff"],
         AlertKind::Won => ["/System/Library/Sounds/Purr.aiff", "/System/Library/Sounds/Bottle.aiff"],
         AlertKind::Lost => ["/System/Library/Sounds/Basso.aiff", "/System/Library/Sounds/Frog.aiff"],
         AlertKind::Expired => ["/System/Library/Sounds/Tink.aiff", "/System/Library/Sounds/Morse.aiff"],
+        AlertKind::ValueArea => ["/System/Library/Sounds/Sosumi.aiff", "/System/Library/Sounds/Pop.aiff"],
     }
 }
 
@@ -45,6 +53,9 @@ fn sounds_for(kind: AlertKind) -> [&'static str; 2] {
 /// sleeps between fire-and-forget `Command::spawn()` calls. The caller
 /// (the async monitor loop) returns immediately either way.
 pub fn play(kind: AlertKind) {
+    if !enabled(kind) {
+        return;
+    }
     let [primary, fallback] = sounds_for(kind);
     let sound = if Path::new(primary).exists() {
         primary
@@ -70,7 +81,7 @@ mod tests {
 
     #[test]
     fn every_alert_kind_maps_to_a_distinct_primary_sound() {
-        let kinds = [AlertKind::Setup, AlertKind::Won, AlertKind::Lost, AlertKind::Expired];
+        let kinds = [AlertKind::Setup, AlertKind::Won, AlertKind::Lost, AlertKind::Expired, AlertKind::ValueArea];
         let primaries: Vec<&str> = kinds.iter().map(|k| sounds_for(*k)[0]).collect();
         let unique: std::collections::HashSet<&&str> = primaries.iter().collect();
         assert_eq!(unique.len(), primaries.len(), "expected all primary sounds to be distinct");
@@ -87,12 +98,28 @@ mod tests {
     #[test]
     fn no_sound_here_overlaps_v1s_set() {
         let v1_sounds = ["Funk.aiff", "Glass.aiff", "Hero.aiff", "Ping.aiff"];
-        for kind in [AlertKind::Setup, AlertKind::Won, AlertKind::Lost, AlertKind::Expired] {
+        for kind in [AlertKind::Setup, AlertKind::Won, AlertKind::Lost, AlertKind::Expired, AlertKind::ValueArea] {
             for path in sounds_for(kind) {
                 for v1 in v1_sounds {
                     assert!(!path.ends_with(v1), "{path} collides with v1's {v1}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn only_the_value_area_alert_makes_a_sound() {
+        assert!(enabled(AlertKind::ValueArea));
+        for kind in [AlertKind::Setup, AlertKind::Won, AlertKind::Lost, AlertKind::Expired] {
+            assert!(!enabled(kind), "{kind:?} should be silent");
+        }
+    }
+
+    #[test]
+    fn the_value_area_sound_is_distinct_from_v1_and_the_cockpit() {
+        let taken = ["Funk.aiff", "Glass.aiff", "Hero.aiff", "Ping.aiff", "Blow.aiff", "Submarine.aiff"];
+        for path in sounds_for(AlertKind::ValueArea) {
+            assert!(!taken.iter().any(|t| path.ends_with(t)), "{path} is already used by v1 or the cockpit");
         }
     }
 }

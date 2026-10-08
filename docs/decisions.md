@@ -362,3 +362,25 @@ sequenceDiagram
 | --- | --- | --- | --- |
 | only_won_and_lost_results_go_to_telegram | MON-012-R1 | unit | Given trades ending Won, Lost, Expired, Invalidated and Skipped, when result_goes_to_telegram runs for each, then true for Won and Lost only. |
 
+## MON-013 — The monitor's only sound is the value-area alert's
+
+**Status:** accepted
+
+**Context:** User, 2026-10-07: keep sounds only for the value-area alert (MON-011); every other v2 sound (setup, won, lost, expired, invalidated) is silent. The cockpit's manual price alert keeps its own sound (Blow/Submarine). The value-area alert plays Sosumi (Pop fallback), which no longer marks setups; setups move to Pop, so every kind keeps a distinct primary and none overlap v1's (Funk, Glass, Hero, Ping) or the cockpit's.
+
+**Consequences:** + a sound from the monitor always means a value-area alert. - won/lost results are now only on Telegram.
+
+### Requirements
+
+| ID | Requirement |
+| --- | --- |
+| MON-013-R1 | WHEN the monitor would play a sound THEN it SHALL play only for the value-area alert |
+| MON-013-R2 | WHEN the value-area sound is chosen THEN it SHALL differ from v1's sounds and the cockpit's price-alert sounds |
+
+### Scenarios
+
+| ID | Requirement | Layer | Scenario |
+| --- | --- | --- | --- |
+| only_the_value_area_alert_makes_a_sound | MON-013-R1 | unit | Given every AlertKind, when sound::enabled runs for each, then true for ValueArea only. |
+| the_value_area_sound_is_distinct_from_v1_and_the_cockpit | MON-013-R2 | unit | Given the ValueArea sounds, when they are compared with Funk, Glass, Hero, Ping, Blow and Submarine, then none match. |
+

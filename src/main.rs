@@ -989,6 +989,7 @@ async fn main() -> Result<()> {
                                 }
                                 tracing::info!("{symbol}: value-area alert {:?} fade {:?} at {}, {}/3 aligned", alert.side, alert.fade, alert.price, alert.agreeing());
                                 notify(&http, &bot_token, &chat_id, &msg).await;
+                                sound::play(sound::AlertKind::ValueArea);
                             }
                         }
                     }

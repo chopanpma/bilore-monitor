@@ -40,3 +40,12 @@ v2's own alerts, mapped to alert *kind* rather than v1's confirm/not split:
   `_alert_zone()` already had a "played twice, or three times if strong"
   pattern; v2 had simplified that away to a single play (see git history),
   not an oversight at the time, now reconsidered.
+
+## Since 2026-10-07 (MON-013)
+
+Only `AlertKind::ValueArea` plays (`enabled()`; user: keep sounds only for the value-area
+alert). It uses Sosumi (Pop fallback); setups moved to Pop so every kind keeps a distinct
+primary. Setup / Won / Lost / Expired calls in `main.rs` remain but are silent. None of
+the sounds overlap v1's (Funk, Glass, Hero, Ping) or the cockpit's price alert (Blow,
+Submarine). Tests: `only_the_value_area_alert_makes_a_sound`,
+`the_value_area_sound_is_distinct_from_v1_and_the_cockpit`.

@@ -358,3 +358,13 @@ def result_message_shows_lost_outcome():
 
 def only_won_and_lost_results_go_to_telegram():
     _delegate('tests::only_won_and_lost_results_go_to_telegram', target=('--bin', 'bilore-monitor'))
+
+
+# --- MON-013 (only the value-area alert makes a sound) ---------------------------
+
+def only_the_value_area_alert_makes_a_sound():
+    _delegate('sound::tests::only_the_value_area_alert_makes_a_sound')
+
+
+def the_value_area_sound_is_distinct_from_v1_and_the_cockpit():
+    _delegate('sound::tests::the_value_area_sound_is_distinct_from_v1_and_the_cockpit')

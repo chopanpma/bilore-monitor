@@ -719,3 +719,34 @@ spec MON-012 {
     # delegates: --bin bilore-monitor tests::only_won_and_lost_results_go_to_telegram
   }
 }
+
+decision MON-013 "The monitor's only sound is the value-area alert's" {
+  status: accepted
+  context: "User, 2026-10-07: keep sounds only for the value-area alert (MON-011); every other v2 sound (setup, won, lost, expired, invalidated) is silent. The cockpit's manual price alert keeps its own sound (Blow/Submarine). The value-area alert plays Sosumi (Pop fallback), which no longer marks setups; setups move to Pop, so every kind keeps a distinct primary and none overlap v1's (Funk, Glass, Hero, Ping) or the cockpit's."
+  consequences: "+ a sound from the monitor always means a value-area alert. - won/lost results are now only on Telegram."
+}
+
+spec MON-013 {
+  requirement MON-013-R1 (EARS) {
+    text: "WHEN the monitor would play a sound THEN it SHALL play only for the value-area alert"
+    layers: [unit]
+    scenarios: [only_the_value_area_alert_makes_a_sound]
+  }
+  requirement MON-013-R2 (EARS) {
+    text: "WHEN the value-area sound is chosen THEN it SHALL differ from v1's sounds and the cockpit's price-alert sounds"
+    layers: [unit]
+    scenarios: [the_value_area_sound_is_distinct_from_v1_and_the_cockpit]
+  }
+  scenario only_the_value_area_alert_makes_a_sound {
+    given: "every AlertKind"
+    when: "sound::enabled runs for each"
+    then: "true for ValueArea only"
+    # delegates: sound::tests::only_the_value_area_alert_makes_a_sound
+  }
+  scenario the_value_area_sound_is_distinct_from_v1_and_the_cockpit {
+    given: "the ValueArea sounds"
+    when: "they are compared with Funk, Glass, Hero, Ping, Blow and Submarine"
+    then: "none match"
+    # delegates: sound::tests::the_value_area_sound_is_distinct_from_v1_and_the_cockpit
+  }
+}
