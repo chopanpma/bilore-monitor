@@ -384,3 +384,29 @@ sequenceDiagram
 | only_the_value_area_alert_makes_a_sound | MON-013-R1 | unit | Given every AlertKind, when sound::enabled runs for each, then true for ValueArea only. |
 | the_value_area_sound_is_distinct_from_v1_and_the_cockpit | MON-013-R2 | unit | Given the ValueArea sounds, when they are compared with Funk, Glass, Hero, Ping, Blow and Submarine, then none match. |
 
+## MON-014 — Only active strategies open trades: ml-model, fade-poc, fade-poc-fill and fade-roll-rth are deprecated, and fade-poc-wide (80-tick stop, 2R) replaces fade-poc-fill
+
+**Status:** accepted
+
+**Context:** User decision 2026-10-12, after re-running the backtests (bilore-ml-rs, IBKR 5-min bars 2025-09-11..2026-09-30 and 105 tick days) and reviewing the shadow scoreboard: ml-model's direction is no better than random (20.0% vs 17.4% on tick-verified fills); fade-poc assumes fills (3 of 5 shadow wins never traded at the entry); today's fade rule with the live ~16-tick stop loses on ticks (-$559) and bars (-$9,604); fade-roll-rth loses at every window length. The registry (bilore-project-conf contracts/strategies.md) marks them deprecated and bilore_core::strategy::ACTIVE lists what still trades: fade-poc-wide, fade-poc-globex, fade-roll-evening (kept for more resolutions) and fade-roll-overnight. fade-poc-wide keeps fade-poc-fill's entries (prior RTH POC, trade_setup entry, fill required, RTH, no model gate) with the stop/target sweep's best geometry for that rule: 80 ticks, 2R (286 trades, 31.9%, +2.1 ticks/trade, +$736 over a year; H1 +$1,510, H2 -$774).
+
+**Consequences:** + the scoreboard stops growing for strategies with no evidence of an edge. + fade-poc-wide starts its own clean record. - fade-poc-wide is a forward test: its backtest edge is small and lost money in the second half. - an 80-tick stop is $100 per MES. - the cockpit's RTH Model and Risk/Setup panels stop updating (they showed the deprecated strategies' live reads). - deprecated trades still open after a restart are managed to their end.
+
+### Requirements
+
+| ID | Requirement |
+| --- | --- |
+| MON-014-R1 | WHEN the monitor would create a setup for a strategy THEN it SHALL do so only if bilore_core::strategy::is_active is true for it |
+| MON-014-R2 | WHEN fade-poc-wide arms a setup THEN it SHALL fade toward the prior RTH POC with trade_setup's entry, an 80-tick stop and a 2R target, and SHALL not re-take a level stopped out that day in the same direction |
+| MON-014-R3 | WHEN the daily summary is built THEN it SHALL list exactly the active strategies |
+
+### Scenarios
+
+| ID | Requirement | Layer | Scenario |
+| --- | --- | --- | --- |
+| deprecated_strategies_are_not_active_for_the_monitor | MON-014-R1 | unit | Given the deprecated slugs, when the monitor asks strategy::is_active, then false. |
+| above_the_prior_poc_it_sells_with_an_80_tick_stop_and_2r_target | MON-014-R2 | unit | Given prior RTH POC 7732.50, VAH 7745.00, VAL 7722.75 and price 7740, when wide::wide_setup runs, then Short at trade_setup's VAH entry, stop 20 points above the entry, target 40 points below. |
+| below_the_prior_poc_it_buys_with_an_80_tick_stop | MON-014-R2 | unit | Given the same profile and price 7728, when wide_setup runs, then Long, stop 20 points below the entry, target 40 points above. |
+| a_level_stopped_out_today_is_not_retaken | MON-014-R2 | unit | Given a Short at that entry stopped out earlier today, when wide_setup runs at 7740 again, then no setup, naming the stopped level. |
+| the_daily_summary_lists_the_active_strategies | MON-014-R3 | unit | Given the registry, when the summary's strategy list is read, then it equals bilore_core::strategy::ACTIVE. |
+

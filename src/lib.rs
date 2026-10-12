@@ -10,3 +10,4 @@ pub mod sound;
 pub mod telegram;
 pub mod va_alert;
 pub mod vol_gate;
+pub mod wide;

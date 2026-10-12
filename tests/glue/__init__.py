@@ -372,3 +372,25 @@ def the_value_area_sound_is_distinct_from_v1_and_the_cockpit():
 
 def send_summary_flag_picks_the_day():
     _delegate('tests::send_summary_flag_picks_the_day', target=('--bin', 'bilore-monitor'))
+
+
+# --- MON-014 (deprecations + fade-poc-wide, 2026-10-12) ----------------------
+
+def deprecated_strategies_are_not_active_for_the_monitor():
+    _delegate('strategy::tests::deprecated_strategies_are_not_active', target=('-p', 'bilore-core', '--lib'))
+
+
+def above_the_prior_poc_it_sells_with_an_80_tick_stop_and_2r_target():
+    _delegate('wide::tests::above_the_prior_poc_it_sells_with_an_80_tick_stop_and_2r_target')
+
+
+def below_the_prior_poc_it_buys_with_an_80_tick_stop():
+    _delegate('wide::tests::below_the_prior_poc_it_buys_with_an_80_tick_stop')
+
+
+def a_level_stopped_out_today_is_not_retaken():
+    _delegate('wide::tests::a_level_stopped_out_today_is_not_retaken')
+
+
+def the_daily_summary_lists_the_active_strategies():
+    _delegate('tests::the_daily_summary_lists_the_active_strategies', target=('--bin', 'bilore-monitor'))
