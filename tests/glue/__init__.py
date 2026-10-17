@@ -394,3 +394,34 @@ def a_level_stopped_out_today_is_not_retaken():
 
 def the_daily_summary_lists_the_active_strategies():
     _delegate('tests::the_daily_summary_lists_the_active_strategies', target=('--bin', 'bilore-monitor'))
+
+
+# --- MON-015 (market-data outage alert, 2026-10-17) -------------------------
+
+
+def market_hours_follow_cme_equity_futures():
+    _delegate('feed_watch::tests::market_hours_follow_cme_equity_futures')
+
+
+def ten_minutes_of_silence_while_open_alerts_once():
+    _delegate('feed_watch::tests::ten_minutes_of_silence_while_open_alerts_once')
+
+
+def quiet_under_ten_minutes_sends_nothing():
+    _delegate('feed_watch::tests::quiet_under_ten_minutes_sends_nothing')
+
+
+def data_back_sends_one_all_clear():
+    _delegate('feed_watch::tests::data_back_sends_one_all_clear')
+
+
+def the_reopen_gets_a_grace_period():
+    _delegate('feed_watch::tests::the_reopen_gets_a_grace_period')
+
+
+def silence_while_closed_never_alerts():
+    _delegate('feed_watch::tests::silence_while_closed_never_alerts')
+
+
+def feed_messages_say_since_when_and_what_to_check():
+    _delegate('telegram::tests::feed_messages_say_since_when_and_what_to_check')

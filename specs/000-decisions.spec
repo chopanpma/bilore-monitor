@@ -710,7 +710,7 @@ spec MON-011 {
   }
 }
 
-decision MON-012 "Telegram carries only won/lost shadow-trade results, the value-area alert and the daily summary" {
+decision MON-012 "Telegram carries only won/lost shadow-trade results, the value-area alert, the daily summary and market-data outage alerts" {
   status: accepted
   context: "User, 2026-10-07: remove the useless Telegram alerts. Setup, invalidated and expired messages, the volatility block notices (SYS-006, now logged only) are no longer sent. The daily summary (MON-008) was switched off too and turned back on 2026-10-08 at the user's request. v1 sends nothing (bilore-ml BML-006); only the value-area alert has a sound (MON-013)."
   consequences: "+ a quiet chat where every message is a finished trade or a manual-trading prompt. - pending setups and volatility blocks are visible only in the logs and the cockpit. + one end-of-day scoreboard per weekday."
@@ -812,5 +812,71 @@ spec MON-014 {
     when: "the summary's strategy list is read"
     then: "it equals bilore_core::strategy::ACTIVE"
     # delegates: --bin bilore-monitor tests::the_daily_summary_lists_the_active_strategies
+  }
+}
+
+decision MON-015 "When no MES trade arrives for 10 minutes while the market is open, Telegram says so once, and again when data is back" {
+  status: accepted
+  context: "User, 2026-10-17: if the IB Gateway login is waiting for phone approval, tell me on Telegram. Measured the same day on MES ticks since 2026-09-30: a real quiet market almost never goes 10 minutes without a trade (RTH never), but the feed dropped repeatedly for ~16 minutes (64 silences of 15-30 min, during RTH too) and for whole nights (09-29 5.6 h, 10-07 5.8 h, 10-08 6.9 h, 10-11 11 h, 10-15 7.3 h). The monitor reads tick_trades, so a silence there covers every cause: gateway waiting for 2FA, gateway down, recorder dead. Market open = CME equity futures: closed 16:00-17:00 CT daily and from Friday 16:00 to Sunday 17:00 CT; silence after a reopen counts from 17:00."
+  consequences: "+ an outage is known within 10 minutes instead of the next morning. - until the ~16-minute drops are fixed, expect real alerts several times a day. - the alert cannot tell the causes apart; the message lists what to check."
+}
+
+spec MON-015 {
+  requirement MON-015-R1 (EARS) {
+    text: "WHEN the market is open and no trade has been recorded for 10 minutes, counting from the later of the last trade and the last 17:00 CT reopen THEN the monitor SHALL send one outage message, and SHALL send one all-clear when trades resume"
+    layers: [unit]
+    scenarios: [ten_minutes_of_silence_while_open_alerts_once, quiet_under_ten_minutes_sends_nothing, data_back_sends_one_all_clear, the_reopen_gets_a_grace_period]
+  }
+  requirement MON-015-R2 (EARS) {
+    text: "WHEN the market is closed (16:00-17:00 CT daily, Friday 16:00 to Sunday 17:00 CT) THEN no outage SHALL be reported"
+    layers: [unit]
+    scenarios: [market_hours_follow_cme_equity_futures, silence_while_closed_never_alerts]
+  }
+  requirement MON-015-R3 (EARS) {
+    text: "WHEN an outage or all-clear message is built THEN it SHALL name the symbol, since when (CT) and for how long, and list what to check"
+    layers: [unit]
+    scenarios: [feed_messages_say_since_when_and_what_to_check]
+  }
+  scenario market_hours_follow_cme_equity_futures {
+    given: "Tue 10:00, Tue 16:30, Tue 17:00, Fri 16:30, Sat 12:00, Sun 16:59 and Sun 17:00 CT"
+    when: "feed_watch::market_open runs"
+    then: "open, closed, open, closed, closed, closed, open"
+    # delegates: feed_watch::tests::market_hours_follow_cme_equity_futures
+  }
+  scenario ten_minutes_of_silence_while_open_alerts_once {
+    given: "last trade Tuesday 10:00 CT"
+    when: "checked at 10:09:59, 10:10, 10:11 and 10:20"
+    then: "nothing, then one Down since 10:00, then nothing more"
+    # delegates: feed_watch::tests::ten_minutes_of_silence_while_open_alerts_once
+  }
+  scenario quiet_under_ten_minutes_sends_nothing {
+    given: "trades every 9 minutes"
+    when: "checked each minute"
+    then: "no notice"
+    # delegates: feed_watch::tests::quiet_under_ten_minutes_sends_nothing
+  }
+  scenario data_back_sends_one_all_clear {
+    given: "an outage since 10:00 CT"
+    when: "a trade arrives at 10:25 and the watch is checked twice"
+    then: "one Back after 25 minutes, then nothing"
+    # delegates: feed_watch::tests::data_back_sends_one_all_clear
+  }
+  scenario the_reopen_gets_a_grace_period {
+    given: "last trade Friday 15:59 CT"
+    when: "checked Sunday 17:05 and 17:10 CT"
+    then: "nothing, then Down since Sunday 17:00"
+    # delegates: feed_watch::tests::the_reopen_gets_a_grace_period
+  }
+  scenario silence_while_closed_never_alerts {
+    given: "last trade Friday 15:59 CT"
+    when: "checked Saturday noon and Sunday 16:59 CT"
+    then: "nothing"
+    # delegates: feed_watch::tests::silence_while_closed_never_alerts
+  }
+  scenario feed_messages_say_since_when_and_what_to_check {
+    given: "an outage on MESZ6 since 23:06 CT, 12 minutes long, and its end after 346 minutes"
+    when: "feed_down_message and feed_back_message run"
+    then: "'NO MARKET DATA — MESZ6', 'since 23:06 CT', '12 min', IB Gateway approval; then 'MARKET DATA BACK — MESZ6' after 346 min"
+    # delegates: telegram::tests::feed_messages_say_since_when_and_what_to_check
   }
 }

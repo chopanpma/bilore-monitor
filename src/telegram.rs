@@ -179,6 +179,25 @@ pub fn va_alert_message(symbol: &str, alert: &crate::va_alert::Alert, profile_te
     )
 }
 
+/// MON-015: no market data while the market is open.
+pub fn feed_down_message(symbol: &str, since: chrono::NaiveDateTime, minutes: i64) -> String {
+    format!(
+        "⚠️ <b>[V2] NO MARKET DATA — {symbol}</b>\n\
+         No trade recorded since {} CT ({minutes} min) while the market is open.\n\
+         Check: IB Gateway waiting for your phone approval · gateway down · tick recorder stopped.",
+        since.format("%H:%M"),
+    )
+}
+
+/// MON-015: market data is back.
+pub fn feed_back_message(symbol: &str, since: chrono::NaiveDateTime, minutes: i64) -> String {
+    format!(
+        "✅ <b>[V2] MARKET DATA BACK — {symbol}</b>\n\
+         Trades recorded again after {minutes} min (since {} CT).",
+        since.format("%H:%M"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +341,19 @@ mod tests {
         let msg = va_alert_message("MESZ6", &alert, "5010.00 ██ \n5009.00 ███ ◀ 5009.25");
         for want in ["[V2] VALUE AREA — MESZ6", "above VAH", "fade SHORT", "Shape: P", "2/3 aligned", "Structure", "Order flow", "Δ -812", "Other timeframe", "RTH", "<pre>", "5009.00 ███ ◀ 5009.25"] {
             assert!(msg.contains(want), "missing {want:?} in\n{msg}");
+        }
+    }
+
+    #[test]
+    fn feed_messages_say_since_when_and_what_to_check() {
+        let since = chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap().and_hms_opt(23, 6, 26).unwrap();
+        let down = feed_down_message("MESZ6", since, 12);
+        for want in ["NO MARKET DATA — MESZ6", "since 23:06 CT", "12 min", "IB Gateway", "phone"] {
+            assert!(down.contains(want), "missing {want:?} in\n{down}");
+        }
+        let back = feed_back_message("MESZ6", since, 346);
+        for want in ["MARKET DATA BACK — MESZ6", "346 min", "since 23:06 CT"] {
+            assert!(back.contains(want), "missing {want:?} in\n{back}");
         }
     }
 }

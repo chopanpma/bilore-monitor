@@ -56,6 +56,7 @@ use bilore_monitor::rolling::{self, RollConfig, RollingLevels};
 use bilore_core::inventory::{self, ReferenceProfile};
 use bilore_core::news;
 use bilore_core::volatility::{Baseline, Release, CALENDAR_UNAVAILABLE};
+use bilore_monitor::feed_watch::{FeedNotice, FeedWatch};
 use bilore_monitor::va_alert;
 use bilore_monitor::vol_gate::{Notice, VolGate};
 use bilore_monitor::{daily_summary, db, globex, levels, sound, telegram, wide};
@@ -347,6 +348,8 @@ struct PerSymbolState {
     rolling: RollingLevels,
     /// One slot per `fade-roll-*` window, see `RollSlot`.
     roll: Vec<RollSlot>,
+    /// MON-015 market-data outage watch.
+    feed: FeedWatch,
     /// `fade-poc-wide` slot (2026-10-12, MON-014): fade-poc-fill's entries,
     /// 80-tick stop / 2R target, RTH only — see `bilore_monitor::wide`.
     wide: StrategySlot,
@@ -660,6 +663,7 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
         vol: VolGate::new(load_vol_baseline(pool, symbol, today_ct).await, None),
         va: VaState::default(),
         wide,
+        feed: FeedWatch::default(),
     })
 }
 
@@ -956,6 +960,18 @@ async fn main() -> Result<()> {
                     continue;
                 }
             };
+
+            // MON-015: market-data outage watch on the newest recorded trade.
+            let latest = ticks.last().map_or(state.last_tick_ts, |t| t.ts);
+            let now_local = Utc::now().with_timezone(&Chicago).naive_local();
+            if let Some(notice) = state.feed.check(now_local, Some(latest.with_timezone(&Chicago).naive_local())) {
+                let text = match notice {
+                    FeedNotice::Down { since, minutes } => telegram::feed_down_message(symbol, since, minutes),
+                    FeedNotice::Back { since, minutes } => telegram::feed_back_message(symbol, since, minutes),
+                };
+                tracing::warn!("{symbol}: {notice:?}");
+                notify(&http, &bot_token, &chat_id, &text).await;
+            }
 
             for tick in &ticks {
                 state.last_tick_ts = tick.ts;

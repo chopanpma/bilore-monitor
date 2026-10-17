@@ -342,7 +342,7 @@ sequenceDiagram
 | the_text_profile_fits_in_24_rows | MON-011-R6 | unit | Given a 60-point range at 0.25 ticks (240 levels), when render_profile runs, then it uses at most 24 rows. |
 | va_alert_message_shows_alignment_and_profile | MON-011-R6 | unit | Given an Upper SHORT alert on a P profile with structure and order flow agreeing, when telegram::va_alert_message runs, then it shows '[V2] VALUE AREA — MESZ6', 'above VAH', 'fade SHORT', 'P', 2/3 aligned, each factor and the profile block. |
 
-## MON-012 — Telegram carries only won/lost shadow-trade results, the value-area alert and the daily summary
+## MON-012 — Telegram carries only won/lost shadow-trade results, the value-area alert, the daily summary and market-data outage alerts
 
 **Status:** accepted
 
@@ -409,4 +409,32 @@ sequenceDiagram
 | below_the_prior_poc_it_buys_with_an_80_tick_stop | MON-014-R2 | unit | Given the same profile and price 7728, when wide_setup runs, then Long, stop 20 points below the entry, target 40 points above. |
 | a_level_stopped_out_today_is_not_retaken | MON-014-R2 | unit | Given a Short at that entry stopped out earlier today, when wide_setup runs at 7740 again, then no setup, naming the stopped level. |
 | the_daily_summary_lists_the_active_strategies | MON-014-R3 | unit | Given the registry, when the summary's strategy list is read, then it equals bilore_core::strategy::ACTIVE. |
+
+## MON-015 — When no MES trade arrives for 10 minutes while the market is open, Telegram says so once, and again when data is back
+
+**Status:** accepted
+
+**Context:** User, 2026-10-17: if the IB Gateway login is waiting for phone approval, tell me on Telegram. Measured the same day on MES ticks since 2026-09-30: a real quiet market almost never goes 10 minutes without a trade (RTH never), but the feed dropped repeatedly for ~16 minutes (64 silences of 15-30 min, during RTH too) and for whole nights (09-29 5.6 h, 10-07 5.8 h, 10-08 6.9 h, 10-11 11 h, 10-15 7.3 h). The monitor reads tick_trades, so a silence there covers every cause: gateway waiting for 2FA, gateway down, recorder dead. Market open = CME equity futures: closed 16:00-17:00 CT daily and from Friday 16:00 to Sunday 17:00 CT; silence after a reopen counts from 17:00.
+
+**Consequences:** + an outage is known within 10 minutes instead of the next morning. - until the ~16-minute drops are fixed, expect real alerts several times a day. - the alert cannot tell the causes apart; the message lists what to check.
+
+### Requirements
+
+| ID | Requirement |
+| --- | --- |
+| MON-015-R1 | WHEN the market is open and no trade has been recorded for 10 minutes, counting from the later of the last trade and the last 17:00 CT reopen THEN the monitor SHALL send one outage message, and SHALL send one all-clear when trades resume |
+| MON-015-R2 | WHEN the market is closed (16:00-17:00 CT daily, Friday 16:00 to Sunday 17:00 CT) THEN no outage SHALL be reported |
+| MON-015-R3 | WHEN an outage or all-clear message is built THEN it SHALL name the symbol, since when (CT) and for how long, and list what to check |
+
+### Scenarios
+
+| ID | Requirement | Layer | Scenario |
+| --- | --- | --- | --- |
+| ten_minutes_of_silence_while_open_alerts_once | MON-015-R1 | unit | Given last trade Tuesday 10:00 CT, when checked at 10:09:59, 10:10, 10:11 and 10:20, then nothing, then one Down since 10:00, then nothing more. |
+| quiet_under_ten_minutes_sends_nothing | MON-015-R1 | unit | Given trades every 9 minutes, when checked each minute, then no notice. |
+| data_back_sends_one_all_clear | MON-015-R1 | unit | Given an outage since 10:00 CT, when a trade arrives at 10:25 and the watch is checked twice, then one Back after 25 minutes, then nothing. |
+| the_reopen_gets_a_grace_period | MON-015-R1 | unit | Given last trade Friday 15:59 CT, when checked Sunday 17:05 and 17:10 CT, then nothing, then Down since Sunday 17:00. |
+| market_hours_follow_cme_equity_futures | MON-015-R2 | unit | Given Tue 10:00, Tue 16:30, Tue 17:00, Fri 16:30, Sat 12:00, Sun 16:59 and Sun 17:00 CT, when feed_watch::market_open runs, then open, closed, open, closed, closed, closed, open. |
+| silence_while_closed_never_alerts | MON-015-R2 | unit | Given last trade Friday 15:59 CT, when checked Saturday noon and Sunday 16:59 CT, then nothing. |
+| feed_messages_say_since_when_and_what_to_check | MON-015-R3 | unit | Given an outage on MESZ6 since 23:06 CT, 12 minutes long, and its end after 346 minutes, when feed_down_message and feed_back_message run, then 'NO MARKET DATA — MESZ6', 'since 23:06 CT', '12 min', IB Gateway approval; then 'MARKET DATA BACK — MESZ6' after 346 min. |
 
