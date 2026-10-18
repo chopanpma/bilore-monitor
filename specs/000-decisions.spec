@@ -1037,3 +1037,23 @@ spec MON-018 {
     # delegates: levels::tests::a_fully_recorded_session_gives_its_poc_and_value_area
   }
 }
+
+decision MON-019 "fade-devpoc-anchor-2r and fade-todaylvl-0.75r leave shadow: both lose on complete sessions" {
+  status: accepted
+  context: "User decision 2026-10-18. Re-run on the 51 sessions recorded in at least 380 of 390 minutes (bilore-ml-rs findings 2026-10-17, 'Data-quality caveat'): fade-devpoc-anchor-2r 296 trades, -$118 (H1 -$384); fade-todaylvl-0.75r 201 trades, -$476, negative in both halves. Their published edge came from near-empty sessions. They are removed from bilore_core::strategy::ACTIVE, so profile_fade arms nothing for them (is_active); their configs and any rows stay."
+  consequences: "+ shadow results concentrate on rules that survive clean data. - if the clean sample (51 sessions) is itself unrepresentative, two possibly-good rules lose their forward test."
+}
+
+spec MON-019 {
+  requirement MON-019-R1 (EARS) {
+    text: "WHEN the profile fades arm THEN fade-devpoc-anchor-2r and fade-todaylvl-0.75r SHALL not, because strategy::is_active is false for them"
+    layers: [unit]
+    scenarios: [retired_profile_fades_are_not_active]
+  }
+  scenario retired_profile_fades_are_not_active {
+    given: "the deprecated slugs, including fade-devpoc-anchor-2r and fade-todaylvl-0.75r (2026-10-18)"
+    when: "strategy::is_active runs for each"
+    then: "false"
+    # delegates: strategy::tests::deprecated_strategies_are_not_active (bilore-core)
+  }
+}

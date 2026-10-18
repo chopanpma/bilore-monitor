@@ -488,3 +488,8 @@ def a_session_with_recording_holes_gives_no_levels():
 
 def a_complete_session_gives_levels():
     _delegate('levels::tests::a_fully_recorded_session_gives_its_poc_and_value_area')
+
+
+# --- MON-019 (two profile fades retired, 2026-10-18) ------------------------
+def retired_profile_fades_are_not_active():
+    _delegate('strategy::tests::deprecated_strategies_are_not_active', target=('-p', 'bilore-core', '--lib'))

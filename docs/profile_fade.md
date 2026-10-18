@@ -2,7 +2,7 @@
 
 Source: `src/profile_fade.rs` (pure) · wired in `main.rs` (`PfSlot`, `PfPrior`,
 `fetch_pf_prior`, `try_pf_signal`, the per-tick MON-017 block) · New 2026-10-18 (MON-017).
-Five strategies, one slot each, registered in `bilore-project-conf/contracts/strategies.md`.
+Five configured strategies, one slot each (two retired 2026-10-18, MON-019: they stay in `configs()` but `is_active` is false), registered in `bilore-project-conf/contracts/strategies.md`.
 
 ## Rule
 

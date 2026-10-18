@@ -515,3 +515,23 @@ sequenceDiagram
 | a_session_with_recording_holes_gives_no_levels | MON-018-R1 | unit | Given ticks from 08:30 to 14:59 but only 267 minutes with ticks (10-16's shape), when rth_levels_from_ticks_pct runs, then no levels. |
 | a_complete_session_gives_levels | MON-018-R1 | unit | Given ticks from 08:30 to 14:59 in 385 minutes, when rth_levels_from_ticks runs, then POC 100.25, value area 100.00-100.25. |
 
+## MON-019 — fade-devpoc-anchor-2r and fade-todaylvl-0.75r leave shadow: both lose on complete sessions
+
+**Status:** accepted
+
+**Context:** User decision 2026-10-18. Re-run on the 51 sessions recorded in at least 380 of 390 minutes (bilore-ml-rs findings 2026-10-17, 'Data-quality caveat'): fade-devpoc-anchor-2r 296 trades, -$118 (H1 -$384); fade-todaylvl-0.75r 201 trades, -$476, negative in both halves. Their published edge came from near-empty sessions. They are removed from bilore_core::strategy::ACTIVE, so profile_fade arms nothing for them (is_active); their configs and any rows stay.
+
+**Consequences:** + shadow results concentrate on rules that survive clean data. - if the clean sample (51 sessions) is itself unrepresentative, two possibly-good rules lose their forward test.
+
+### Requirements
+
+| ID | Requirement |
+| --- | --- |
+| MON-019-R1 | WHEN the profile fades arm THEN fade-devpoc-anchor-2r and fade-todaylvl-0.75r SHALL not, because strategy::is_active is false for them |
+
+### Scenarios
+
+| ID | Requirement | Layer | Scenario |
+| --- | --- | --- | --- |
+| retired_profile_fades_are_not_active | MON-019-R1 | unit | Given the deprecated slugs, including fade-devpoc-anchor-2r and fade-todaylvl-0.75r (2026-10-18), when strategy::is_active runs for each, then false. |
+
