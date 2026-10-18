@@ -306,6 +306,26 @@ pub async fn last_rth_volume_profile(
     })
 }
 
+/// High and low of `symbol`'s recorded trades from `from` to `to` (Chicago
+/// wall clock) — MON-017's overnight range (prior RTH 15:00 -> 08:30).
+pub async fn price_range(
+    pool: &PgPool,
+    symbol: &str,
+    from: chrono::NaiveDateTime,
+    to: chrono::NaiveDateTime,
+) -> Result<Option<(Decimal, Decimal)>> {
+    let row: (Option<Decimal>, Option<Decimal>) = sqlx::query_as(
+        "SELECT max(price), min(price) FROM tick_trades WHERE symbol = $1 \
+         AND ts >= ($2::timestamp AT TIME ZONE 'America/Chicago') AND ts < ($3::timestamp AT TIME ZONE 'America/Chicago')",
+    )
+    .bind(symbol)
+    .bind(from)
+    .bind(to)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0.zip(row.1))
+}
+
 /// Every open (`pending`/`entered`) row of one strategy, any date, newest
 /// first — the fade-roll-* restore keeps the one belonging to the window
 /// in progress and expires the rest (`main.rs` `init_symbol_state`).

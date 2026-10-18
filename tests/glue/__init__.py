@@ -462,3 +462,20 @@ def at_15_00_a_pending_setup_expires():
 
 def priorpoc_trust_is_the_extension_beyond_the_prior_poc_over_its_40_tick_stop():
     _delegate('priorpoc::tests::priorpoc_trust_is_the_extension_beyond_the_prior_poc_over_its_40_tick_stop')
+
+
+# --- MON-017 (five profile fades, 2026-10-18) -------------------------------
+def the_five_profile_fades_are_the_sweep_winners():
+    _delegate('profile_fade::tests::the_five_profile_fades_are_the_sweep_winners')
+
+
+def a_stable_poc_fade_leans_on_the_prior_poc_until_clear_then_the_developing_one():
+    _delegate('profile_fade::tests::a_stable_poc_fade_leans_on_the_prior_poc_until_clear_then_the_developing_one')
+
+
+def todays_levels_add_entry_anchors():
+    _delegate('profile_fade::tests::todays_levels_add_entry_anchors')
+
+
+def profile_fade_trust_follows_the_registry():
+    _delegate('profile_fade::tests::profile_fade_trust_follows_the_registry')

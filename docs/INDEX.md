@@ -21,6 +21,7 @@ via `git config core.hooksPath .githooks`). `db.rs` (DB I/O) and `main.rs`
 | `va_alert.rs` | done (2026-10-07 — value-area alert for manual trading, MON-011) | [va_alert.md](va_alert.md) |
 | `wide.rs` | done (2026-10-12 — `fade-poc-wide`, MON-014) | [wide.md](wide.md) |
 | `priorpoc.rs` | done (2026-10-18 — `fade-priorpoc-2r`, MON-016) | [priorpoc.md](priorpoc.md) |
+| `profile_fade.rs` | done (2026-10-18 — five sweep fades, MON-017) | [profile_fade.md](profile_fade.md) |
 | `feed_watch.rs` | done (2026-10-17 — market-data outage alert, MON-015) | [feed_watch.md](feed_watch.md) |
 | `bin/repair_session_profiles.rs` | one-off data repair (2026-10-02) | [repair_session_profiles.md](repair_session_profiles.md) |
 | `db.rs` | exempt (I/O) | — |

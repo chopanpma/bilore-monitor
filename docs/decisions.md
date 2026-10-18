@@ -469,3 +469,28 @@ sequenceDiagram
 | at_15_00_a_pending_setup_expires | MON-016-R3 | unit | Given a pending Long, when priorpoc::close_at_rth_end runs, then Expired with no exit price. |
 | priorpoc_trust_is_the_extension_beyond_the_prior_poc_over_its_40_tick_stop | MON-016-R4 | unit | Given price 7740 with prior POC 7732.50 and the Short setup's 10-point stop, when priorpoc::trust runs, then 0.875 (7.5 of 10 points extended). |
 
+## MON-017 — The other five 2026-10-17 sweep winners run in shadow, each in its own slot, on bilore-ml-rs's shared sweep engine
+
+**Status:** accepted
+
+**Context:** User, 2026-10-18: build all the remaining sweep strategies, each in shadow independently, to learn as fast as possible which ones are valid and graduate. Each is a profile_fade config on poc_anchor's TodayTracker + arm (ML-007), the code the sweep itself now runs; the re-run on that code reproduced every published number (bilore-ml-rs docs/findings/2026-10-17-profile-sweep.md). fade-devpoc-sw: C stable, VA 60, 120t, 1R, no re-take (167t, +$2,721). fade-devpoc-anchor-2r: E+C, VA 60, 40t, 2R, re-take allowed (441t, +$2,735). fade-devpoc-live-va: E+C, VA 70, 120t, 0.75R, re-take allowed (252t, +$2,048). fade-devpoc-0930: C 09:30, VA 60, 120t, 1R, no re-take (175t, +$996). fade-todaylvl-0.75r: E, VA 60, 60t, 0.75R, re-take allowed (361t, +$834). The three re-take rules are deliberate exceptions to the 2026-09-30 no-re-take rule: their evidence is the re-take version. Like the sweep: prior levels only from a fully recorded RTH session's ticks, overnight high/low from that session's 15:00 to 08:30, RTH only, closed at 15:00.
+
+**Consequences:** + five independent records start together; each graduates or is retired on its own. + live = backtest by construction. - all five are in-sample winners of a 1,200-combo search, so some will fail. - three re-take a level that just stopped them out. - 120-tick stops cost $150 per MES. - live keeps SYS-006 blocks the sweep didn't have.
+
+### Requirements
+
+| ID | Requirement |
+| --- | --- |
+| MON-017-R1 | WHEN the monitor starts THEN profile_fade SHALL run exactly the five sweep rules with their variant, value-area percent, stop, target and re-take setting |
+| MON-017-R2 | WHEN a profile fade arms THEN it SHALL fade the variant's active POC with poc_anchor::arm over the live TodayTracker's today and clear state |
+| MON-017-R3 | WHEN a profile fade stores a setup THEN its confidence SHALL be 0.5 + 0.5 x clamp01(distance / stop distance), the distance measured to the faded POC (devpoc-sw, devpoc-live-va, devpoc-0930) or to the nearest of today's levels (devpoc-anchor-2r, todaylvl-0.75r) |
+
+### Scenarios
+
+| ID | Requirement | Layer | Scenario |
+| --- | --- | --- | --- |
+| the_five_profile_fades_are_the_sweep_winners | MON-017-R1 | unit | Given profile_fade::configs, when it is read, then devpoc-sw C-stable 60 120t 1R no-retake; devpoc-anchor-2r E+C 60 40t 2R retake; devpoc-live-va E+C 70 120t 0.75R retake; devpoc-0930 C-time 60 120t 1R no-retake; todaylvl-0.75r E 60 60t 0.75R retake. |
+| a_stable_poc_fade_leans_on_the_prior_poc_until_clear_then_the_developing_one | MON-017-R2 | unit | Given prior POC 7732.50, developing POC 7770, price 7750, when fade-devpoc-sw arms before and after the stable trigger, then Short against the prior POC before; Long toward the developing POC after. |
+| todays_levels_add_entry_anchors | MON-017-R2 | unit | Given today's IB low 7748 below price 7750 with the prior POC above, when fade-todaylvl-0.75r arms, then the anchor may be one of today's levels. |
+| profile_fade_trust_follows_the_registry | MON-017-R3 | unit | Given price 7766, faded developing POC 7770, nearest of today's levels IB high 7768, a 10-point stop, when trust runs for a POC rule and a today-levels rule, then 0.7 and 0.6. |
+
