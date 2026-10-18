@@ -479,3 +479,12 @@ def todays_levels_add_entry_anchors():
 
 def profile_fade_trust_follows_the_registry():
     _delegate('profile_fade::tests::profile_fade_trust_follows_the_registry')
+
+
+# --- MON-018 (complete prior session, 2026-10-18) ---------------------------
+def a_session_with_recording_holes_gives_no_levels():
+    _delegate('levels::tests::a_session_with_recording_holes_gives_no_levels')
+
+
+def a_complete_session_gives_levels():
+    _delegate('levels::tests::a_fully_recorded_session_gives_its_poc_and_value_area')

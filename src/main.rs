@@ -522,12 +522,12 @@ async fn fetch_prior_session(
     // Prefer the profile built from the recorded ticks (2026-10-02): the
     // session_profiles row can be an incomplete live upsert until the next
     // morning's backfill — see bilore_monitor::levels.
-    if let Some((day, rows, first, last)) = db::last_rth_volume_profile(pool, symbol, before).await? {
-        if let Some(levels) = levels::rth_levels_from_ticks(&rows, first, last) {
+    if let Some((day, rows, first, last, minutes)) = db::last_rth_volume_profile(pool, symbol, before).await? {
+        if let Some(levels) = levels::rth_levels_from_ticks(&rows, first, last, minutes) {
             tracing::info!("{symbol}: prior RTH {day} from ticks — POC {} VAH {} VAL {}", levels.poc, levels.vah, levels.val);
             return Ok(Some(levels));
         }
-        tracing::warn!("{symbol}: RTH {day} not fully recorded ({first}-{last}) — using session_profiles");
+        tracing::warn!("{symbol}: RTH {day} not fully recorded ({first}-{last}, {minutes}/390 minutes) — using session_profiles");
     }
     async fn query(pool: &PgPool, symbol: &str, before: NaiveDate) -> Result<Option<(Decimal, Decimal, Decimal)>> {
         Ok(sqlx::query_as(
@@ -554,14 +554,14 @@ async fn fetch_prior_session(
 /// the recorded ticks only — no `session_profiles` fallback (that row is
 /// the 70% value area, and the sweep only used fully recorded sessions).
 async fn fetch_prior_rth_pct(pool: &PgPool, symbol: &str, before: NaiveDate, pct: u64) -> Result<Option<ProfileLevels>> {
-    let Some((day, rows, first, last)) = db::last_rth_volume_profile(pool, symbol, before).await? else {
+    let Some((day, rows, first, last, minutes)) = db::last_rth_volume_profile(pool, symbol, before).await? else {
         tracing::warn!("{symbol}: no recorded prior RTH — no {} setups", strategy::FADE_PRIORPOC_2R);
         return Ok(None);
     };
-    let levels = levels::rth_levels_from_ticks_pct(&rows, first, last, pct);
+    let levels = levels::rth_levels_from_ticks_pct(&rows, first, last, minutes, pct);
     match &levels {
         Some(l) => tracing::info!("{symbol}: prior RTH {day} {pct}% value area — POC {} VAH {} VAL {}", l.poc, l.vah, l.val),
-        None => tracing::warn!("{symbol}: RTH {day} not fully recorded ({first}-{last}) — no {} setups", strategy::FADE_PRIORPOC_2R),
+        None => tracing::warn!("{symbol}: RTH {day} not fully recorded ({first}-{last}, {minutes}/390 minutes) — no {} setups", strategy::FADE_PRIORPOC_2R),
     }
     Ok(levels)
 }
@@ -569,15 +569,15 @@ async fn fetch_prior_rth_pct(pool: &PgPool, symbol: &str, before: NaiveDate, pct
 /// MON-017: the prior RTH profile at 60% and 70% from a fully recorded
 /// session's ticks, else `None` (no profile-fade setups that day).
 async fn fetch_pf_prior(pool: &PgPool, symbol: &str, before: NaiveDate) -> Result<Option<PfPrior>> {
-    let Some((day, rows, first, last)) = db::last_rth_volume_profile(pool, symbol, before).await? else { return Ok(None) };
+    let Some((day, rows, first, last, minutes)) = db::last_rth_volume_profile(pool, symbol, before).await? else { return Ok(None) };
     let at = |pct| {
-        levels::rth_levels_from_ticks_pct(&rows, first, last, pct)
+        levels::rth_levels_from_ticks_pct(&rows, first, last, minutes, pct)
             .map(|l| bilore_ml_rs::poc_anchor::Profile3 { poc: l.poc, vah: l.vah, val: l.val })
     };
     let prior = at(60).zip(at(70)).map(|(p60, p70)| PfPrior { day, p60, p70 });
     match &prior {
         Some(p) => tracing::info!("{symbol}: profile fades prior RTH {day} — 60% POC {} VA {}-{}, 70% VA {}-{}", p.p60.poc, p.p60.val, p.p60.vah, p.p70.val, p.p70.vah),
-        None => tracing::warn!("{symbol}: RTH {day} not fully recorded ({first}-{last}) — no profile-fade setups"),
+        None => tracing::warn!("{symbol}: RTH {day} not fully recorded ({first}-{last}, {minutes}/390 minutes) — no profile-fade setups"),
     }
     Ok(prior)
 }

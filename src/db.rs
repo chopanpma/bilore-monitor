@@ -270,7 +270,7 @@ pub async fn last_rth_volume_profile(
     pool: &PgPool,
     symbol: &str,
     before: NaiveDate,
-) -> Result<Option<(NaiveDate, Vec<(Decimal, i64)>, chrono::NaiveTime, chrono::NaiveTime)>> {
+) -> Result<Option<(NaiveDate, Vec<(Decimal, i64)>, chrono::NaiveTime, chrono::NaiveTime, i64)>> {
     let day: Option<NaiveDate> = sqlx::query_scalar(
         "SELECT max((ts AT TIME ZONE 'America/Chicago')::date) FROM tick_trades \
          WHERE symbol = $1 \
@@ -293,15 +293,16 @@ pub async fn last_rth_volume_profile(
             .bind(day)
             .fetch_all(pool)
             .await?;
-    let span: (Option<chrono::NaiveTime>, Option<chrono::NaiveTime>) = sqlx::query_as(&format!(
-        "SELECT min((ts AT TIME ZONE 'America/Chicago')::time), max((ts AT TIME ZONE 'America/Chicago')::time) FROM tick_trades WHERE {window}"
+    let span: (Option<chrono::NaiveTime>, Option<chrono::NaiveTime>, i64) = sqlx::query_as(&format!(
+        "SELECT min((ts AT TIME ZONE 'America/Chicago')::time), max((ts AT TIME ZONE 'America/Chicago')::time), \
+                count(DISTINCT date_trunc('minute', ts)) FROM tick_trades WHERE {window}"
     ))
     .bind(symbol)
     .bind(day)
     .fetch_one(pool)
     .await?;
     Ok(match span {
-        (Some(first), Some(last)) => Some((day, rows, first, last)),
+        (Some(first), Some(last), minutes) => Some((day, rows, first, last, minutes)),
         _ => None,
     })
 }

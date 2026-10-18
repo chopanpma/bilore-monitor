@@ -16,17 +16,22 @@ use chrono::NaiveTime;
 use rust_decimal::Decimal;
 
 /// RTH POC/VAH/VAL from that session's volume at price, or `None` when the
-/// recording doesn't span the session (first tick after 08:35 CT or last
-/// before 14:55 CT) or is empty.
-pub fn rth_levels_from_ticks(volume_at_price: &[(Decimal, i64)], first: NaiveTime, last: NaiveTime) -> Option<ProfileLevels> {
-    rth_levels_from_ticks_pct(volume_at_price, first, last, 70)
+/// recording isn't complete (`poc_anchor::fully_recorded`: ticks from
+/// 08:35, after 14:55 and in >= 380 of the 390 minutes — MON-018) or is empty.
+pub fn rth_levels_from_ticks(volume_at_price: &[(Decimal, i64)], first: NaiveTime, last: NaiveTime, minutes: i64) -> Option<ProfileLevels> {
+    rth_levels_from_ticks_pct(volume_at_price, first, last, minutes, 70)
 }
 
 /// Same as `rth_levels_from_ticks` with a value area covering `pct`% of the
 /// volume (fade-priorpoc-2r uses 60, MON-016).
-pub fn rth_levels_from_ticks_pct(volume_at_price: &[(Decimal, i64)], first: NaiveTime, last: NaiveTime, pct: u64) -> Option<ProfileLevels> {
-    let hm = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
-    if first > hm(8, 35) || last < hm(14, 55) {
+pub fn rth_levels_from_ticks_pct(
+    volume_at_price: &[(Decimal, i64)],
+    first: NaiveTime,
+    last: NaiveTime,
+    minutes: i64,
+    pct: u64,
+) -> Option<ProfileLevels> {
+    if !bilore_ml_rs::poc_anchor::fully_recorded(first, last, minutes) {
         return None;
     }
     let mut vp = VolumeProfile::default();
@@ -55,20 +60,20 @@ mod tests {
 
     #[test]
     fn a_fully_recorded_session_gives_its_poc_and_value_area() {
-        let l = rth_levels_from_ticks(&rows(), t(8, 30), t(14, 59)).expect("levels");
+        let l = rth_levels_from_ticks(&rows(), t(8, 30), t(14, 59), 385).expect("levels");
         assert_eq!((l.poc, l.val, l.vah), (d("100.25"), d("100.00"), d("100.25")));
         assert_eq!((l.ib_high, l.ib_low), (None, None));
     }
 
     #[test]
     fn a_partly_recorded_session_is_not_trusted() {
-        assert!(rth_levels_from_ticks(&rows(), t(9, 10), t(14, 59)).is_none(), "late start");
-        assert!(rth_levels_from_ticks(&rows(), t(8, 30), t(13, 0)).is_none(), "early stop");
+        assert!(rth_levels_from_ticks(&rows(), t(9, 10), t(14, 59), 385).is_none(), "late start");
+        assert!(rth_levels_from_ticks(&rows(), t(8, 30), t(13, 0), 385).is_none(), "early stop");
     }
 
     #[test]
     fn no_ticks_no_levels() {
-        assert!(rth_levels_from_ticks(&[], t(8, 30), t(14, 59)).is_none());
+        assert!(rth_levels_from_ticks(&[], t(8, 30), t(14, 59), 385).is_none());
     }
 
     // A session whose 70% value area is 100.00-100.50 (65 of 100 contracts
@@ -79,14 +84,20 @@ mod tests {
 
     #[test]
     fn a_60_percent_value_area_is_cut_from_the_same_ticks() {
-        let seventy = rth_levels_from_ticks(&wider_rows(), t(8, 30), t(14, 59)).expect("70%");
+        let seventy = rth_levels_from_ticks(&wider_rows(), t(8, 30), t(14, 59), 385).expect("70%");
         assert_eq!((seventy.val, seventy.vah), (d("100.00"), d("100.50")));
-        let sixty = rth_levels_from_ticks_pct(&wider_rows(), t(8, 30), t(14, 59), 60).expect("60%");
+        let sixty = rth_levels_from_ticks_pct(&wider_rows(), t(8, 30), t(14, 59), 385, 60).expect("60%");
         assert_eq!((sixty.poc, sixty.val, sixty.vah), (d("100.25"), d("100.00"), d("100.25")));
     }
 
     #[test]
     fn a_partly_recorded_session_gives_no_60_percent_levels() {
-        assert!(rth_levels_from_ticks_pct(&wider_rows(), t(9, 10), t(14, 59), 60).is_none());
+        assert!(rth_levels_from_ticks_pct(&wider_rows(), t(9, 10), t(14, 59), 385, 60).is_none());
+    }
+
+    #[test]
+    fn a_session_with_recording_holes_gives_no_levels() {
+        assert!(rth_levels_from_ticks_pct(&wider_rows(), t(8, 30), t(14, 59), 267, 60).is_none(), "10-16's shape");
+        assert!(rth_levels_from_ticks(&wider_rows(), t(8, 30), t(14, 59), 379).is_none());
     }
 }

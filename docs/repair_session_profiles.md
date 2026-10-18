@@ -24,3 +24,5 @@ Run 2026-10-02 on MESZ6 from 2026-09-15: 13 rows repaired (10-01 POC
 Uses the same profile code as the live strategies, so stored and live levels
 agree. `MESZ6-GLOBEX` rows are not covered: overnight ticks are only
 complete since the recorder watchdog (2026-09-30).
+
+2026-10-18 (MON-018): a day whose recording has holes (fewer than 380 of 390 minutes with ticks) is skipped; its existing row is kept.

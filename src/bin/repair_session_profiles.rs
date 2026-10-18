@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     for (date, old_poc, old_vah, old_val) in rows {
         let found = db::last_rth_volume_profile(&pool, &symbol, date.succ_opt().unwrap()).await?;
         let new = match found {
-            Some((day, vols, first, last)) if day == date => levels::rth_levels_from_ticks(&vols, first, last),
+            Some((day, vols, first, last, minutes)) if day == date => levels::rth_levels_from_ticks(&vols, first, last, minutes),
             _ => None,
         };
         let Some(new) = new else {

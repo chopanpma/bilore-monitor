@@ -1011,3 +1011,29 @@ spec MON-017 {
     # delegates: profile_fade::tests::profile_fade_trust_follows_the_registry
   }
 }
+
+decision MON-018 "Prior RTH levels from ticks need a complete session: ticks in at least 380 of the 390 minutes (ML-008)" {
+  status: accepted
+  context: "User, 2026-10-18 (yes to tightening the live check). levels::rth_levels_from_ticks only checked the first and last tick, so a day full of recorder drop-outs (2026-10-16: 16 holes, 123 minutes) would give the next day's strategies levels built from a partial profile. It now uses bilore-ml-rs poc_anchor::fully_recorded, the rule the profile sweep uses, so live and backtest pick sessions the same way. fade-priorpoc-2r and the profile fades then arm nothing that day; fade-poc-wide keeps its session_profiles fallback (MON-014)."
+  consequences: "+ no strategy trades on levels from a broken recording. - each recorder drop-out day costs the tick-level strategies the next day."
+}
+
+spec MON-018 {
+  requirement MON-018-R1 (EARS) {
+    text: "WHEN the prior RTH levels are built from recorded ticks THEN there SHALL be none unless poc_anchor::fully_recorded holds for that session's first tick, last tick and minutes with ticks"
+    layers: [unit]
+    scenarios: [a_session_with_recording_holes_gives_no_levels, a_complete_session_gives_levels]
+  }
+  scenario a_session_with_recording_holes_gives_no_levels {
+    given: "ticks from 08:30 to 14:59 but only 267 minutes with ticks (10-16's shape)"
+    when: "rth_levels_from_ticks_pct runs"
+    then: "no levels"
+    # delegates: levels::tests::a_session_with_recording_holes_gives_no_levels
+  }
+  scenario a_complete_session_gives_levels {
+    given: "ticks from 08:30 to 14:59 in 385 minutes"
+    when: "rth_levels_from_ticks runs"
+    then: "POC 100.25, value area 100.00-100.25"
+    # delegates: levels::tests::a_fully_recorded_session_gives_its_poc_and_value_area
+  }
+}

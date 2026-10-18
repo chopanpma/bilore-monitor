@@ -494,3 +494,24 @@ sequenceDiagram
 | todays_levels_add_entry_anchors | MON-017-R2 | unit | Given today's IB low 7748 below price 7750 with the prior POC above, when fade-todaylvl-0.75r arms, then the anchor may be one of today's levels. |
 | profile_fade_trust_follows_the_registry | MON-017-R3 | unit | Given price 7766, faded developing POC 7770, nearest of today's levels IB high 7768, a 10-point stop, when trust runs for a POC rule and a today-levels rule, then 0.7 and 0.6. |
 
+## MON-018 — Prior RTH levels from ticks need a complete session: ticks in at least 380 of the 390 minutes (ML-008)
+
+**Status:** accepted
+
+**Context:** User, 2026-10-18 (yes to tightening the live check). levels::rth_levels_from_ticks only checked the first and last tick, so a day full of recorder drop-outs (2026-10-16: 16 holes, 123 minutes) would give the next day's strategies levels built from a partial profile. It now uses bilore-ml-rs poc_anchor::fully_recorded, the rule the profile sweep uses, so live and backtest pick sessions the same way. fade-priorpoc-2r and the profile fades then arm nothing that day; fade-poc-wide keeps its session_profiles fallback (MON-014).
+
+**Consequences:** + no strategy trades on levels from a broken recording. - each recorder drop-out day costs the tick-level strategies the next day.
+
+### Requirements
+
+| ID | Requirement |
+| --- | --- |
+| MON-018-R1 | WHEN the prior RTH levels are built from recorded ticks THEN there SHALL be none unless poc_anchor::fully_recorded holds for that session's first tick, last tick and minutes with ticks |
+
+### Scenarios
+
+| ID | Requirement | Layer | Scenario |
+| --- | --- | --- | --- |
+| a_session_with_recording_holes_gives_no_levels | MON-018-R1 | unit | Given ticks from 08:30 to 14:59 but only 267 minutes with ticks (10-16's shape), when rth_levels_from_ticks_pct runs, then no levels. |
+| a_complete_session_gives_levels | MON-018-R1 | unit | Given ticks from 08:30 to 14:59 in 385 minutes, when rth_levels_from_ticks runs, then POC 100.25, value area 100.00-100.25. |
+
