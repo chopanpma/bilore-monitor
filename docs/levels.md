@@ -14,6 +14,7 @@ flowchart TD
 | Function | Contract | Tests |
 |---|---|---|
 | `rth_levels_from_ticks(rows, first, last)` | POC/VAH/VAL from volume at price; `None` if partly recorded or empty | `a_fully_recorded_session_gives_its_poc_and_value_area`, `a_partly_recorded_session_is_not_trusted`, `no_ticks_no_levels` |
+| `rth_levels_from_ticks_pct(rows, first, last, pct)` | Same with a `pct`% value area (fade-priorpoc-2r: 60, MON-016) | `a_60_percent_value_area_is_cut_from_the_same_ticks`, `a_partly_recorded_session_gives_no_60_percent_levels` |
 
 Why not `session_profiles`: tpo-builder's RTH session has no end, so its
 live row includes post-close and early-Globex trading until 19:00 CT

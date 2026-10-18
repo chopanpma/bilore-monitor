@@ -27,7 +27,8 @@ no-re-take rule, restore on restart and the CT-day rollover work as for the othe
 | Symbol | Purpose | Tests |
 |---|---|---|
 | `geometry()` | 80-tick stop, 2R | via `wide_setup` tests |
-| `wide_setup()` | Direction, entry, stop, target or why not | `above_the_prior_poc_it_sells_with_an_80_tick_stop_and_2r_target`, `below_the_prior_poc_it_buys_with_an_80_tick_stop`, `a_level_stopped_out_today_is_not_retaken` |
+| `wide_setup()` | Direction, entry, stop, target or why not (`prior_poc_setup` with `geometry()`) | `above_the_prior_poc_it_sells_with_an_80_tick_stop_and_2r_target`, `below_the_prior_poc_it_buys_with_an_80_tick_stop`, `a_level_stopped_out_today_is_not_retaken` |
+| `prior_poc_setup()` | The shared prior-POC fade with any geometry; also used by `priorpoc` (fade-priorpoc-2r) | via `wide` and `priorpoc` tests |
 
 ## Known deviations / scope notes
 

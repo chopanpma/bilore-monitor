@@ -19,6 +19,12 @@ use rust_decimal::Decimal;
 /// recording doesn't span the session (first tick after 08:35 CT or last
 /// before 14:55 CT) or is empty.
 pub fn rth_levels_from_ticks(volume_at_price: &[(Decimal, i64)], first: NaiveTime, last: NaiveTime) -> Option<ProfileLevels> {
+    rth_levels_from_ticks_pct(volume_at_price, first, last, 70)
+}
+
+/// Same as `rth_levels_from_ticks` with a value area covering `pct`% of the
+/// volume (fade-priorpoc-2r uses 60, MON-016).
+pub fn rth_levels_from_ticks_pct(volume_at_price: &[(Decimal, i64)], first: NaiveTime, last: NaiveTime, pct: u64) -> Option<ProfileLevels> {
     let hm = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
     if first > hm(8, 35) || last < hm(14, 55) {
         return None;
@@ -27,7 +33,7 @@ pub fn rth_levels_from_ticks(volume_at_price: &[(Decimal, i64)], first: NaiveTim
     for (price, volume) in volume_at_price {
         vp.add(*price, (*volume).max(0) as u64);
     }
-    let (val, vah) = vp.value_area()?;
+    let (val, vah) = vp.value_area_pct(pct)?;
     Some(ProfileLevels { poc: vp.poc()?, vah, val, ib_high: None, ib_low: None })
 }
 
@@ -63,5 +69,24 @@ mod tests {
     #[test]
     fn no_ticks_no_levels() {
         assert!(rth_levels_from_ticks(&[], t(8, 30), t(14, 59)).is_none());
+    }
+
+    // A session whose 70% value area is 100.00-100.50 (65 of 100 contracts
+    // at 100.00-100.25, then 100.50 brings it to 85).
+    fn wider_rows() -> Vec<(Decimal, i64)> {
+        vec![(d("99.75"), 10), (d("100.00"), 25), (d("100.25"), 40), (d("100.50"), 20), (d("100.75"), 5)]
+    }
+
+    #[test]
+    fn a_60_percent_value_area_is_cut_from_the_same_ticks() {
+        let seventy = rth_levels_from_ticks(&wider_rows(), t(8, 30), t(14, 59)).expect("70%");
+        assert_eq!((seventy.val, seventy.vah), (d("100.00"), d("100.50")));
+        let sixty = rth_levels_from_ticks_pct(&wider_rows(), t(8, 30), t(14, 59), 60).expect("60%");
+        assert_eq!((sixty.poc, sixty.val, sixty.vah), (d("100.25"), d("100.00"), d("100.25")));
+    }
+
+    #[test]
+    fn a_partly_recorded_session_gives_no_60_percent_levels() {
+        assert!(rth_levels_from_ticks_pct(&wider_rows(), t(9, 10), t(14, 59), 60).is_none());
     }
 }

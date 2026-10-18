@@ -880,3 +880,86 @@ spec MON-015 {
     # delegates: telegram::tests::feed_messages_say_since_when_and_what_to_check
   }
 }
+
+decision MON-016 "fade-priorpoc-2r: today's prior-RTH-POC fade with a 60% value area, a 40-tick stop and a 2R target, RTH only, closed at 15:00 — the first 2026-10-17 sweep strategy in shadow" {
+  status: accepted
+  context: "User decision 2026-10-18: put the 2026-10-17 tick sweep's winners in shadow, starting with the registry's lowest-risk one. bilore-ml-rs backtest_profile_sweep (docs/findings/2026-10-17-profile-sweep.md), variant A over 109 fully recorded RTH sessions, fill required, 2 ticks cost: 116 trades, 40.6% won, +$1,005, max drawdown -$420, H1 +$283, H2 +$723. The rule is fade-poc-wide's (fade toward the prior RTH POC, trade_setup's entry, no re-take of a stopped level, flip invalidation) with two differences taken from the sweep: the prior session's value area covers 60% of its volume instead of 70%, so entries sit closer to the POC, and the stop is 40 ticks with a 2R target. Like the sweep, prior levels come only from a fully recorded RTH session's ticks (no session_profiles fallback, which is 70%), and the trade ends at 15:00 CT: a pending setup expires, an open position is closed at the last RTH price."
+  consequences: "+ the live rule is the backtested rule, so the shadow record measures the backtest's edge. + the smallest drawdown of the six winners; a stop costs $50 per MES. - in-sample: picked from 1,200 combinations on the same sessions. - live keeps SYS-006 (no new setups 08:30-09:00 or around US releases, spikes), which the sweep didn't have. - a day after an incompletely recorded RTH session has no setups."
+}
+
+spec MON-016 {
+  requirement MON-016-R1 (EARS) {
+    text: "WHEN the prior RTH session is fully recorded THEN fade-priorpoc-2r's levels SHALL be its tick volume profile's POC and 60% value area; otherwise there SHALL be no levels"
+    layers: [unit]
+    scenarios: [a_60_percent_value_area_is_cut_from_the_same_ticks, a_partly_recorded_session_gives_no_60_percent_levels]
+  }
+  requirement MON-016-R2 (EARS) {
+    text: "WHEN fade-priorpoc-2r arms a setup THEN it SHALL fade toward the prior RTH POC with trade_setup's entry, a 40-tick stop and a 2R target, and SHALL not re-take a level stopped out that day in the same direction"
+    layers: [unit]
+    scenarios: [above_the_prior_poc_it_sells_with_a_40_tick_stop_and_2r_target, below_the_prior_poc_it_buys_with_a_40_tick_stop, a_stopped_level_is_not_retaken_by_priorpoc]
+  }
+  requirement MON-016-R3 (EARS) {
+    text: "WHILE outside 08:30-15:00 CT THEN fade-priorpoc-2r SHALL arm nothing, and at 15:00 its open trade SHALL end: a pending setup expires, an entered one is closed at the last RTH price"
+    layers: [unit]
+    scenarios: [it_trades_only_from_08_30_to_15_00, at_15_00_an_entered_trade_closes_at_the_last_rth_price, at_15_00_a_pending_setup_expires]
+  }
+  requirement MON-016-R4 (EARS) {
+    text: "WHEN fade-priorpoc-2r stores a setup THEN its confidence SHALL be the registry's entry trust: 0.5 + 0.5 x clamp01(|price - prior POC| / stop distance)"
+    layers: [unit]
+    scenarios: [priorpoc_trust_is_the_extension_beyond_the_prior_poc_over_its_40_tick_stop]
+  }
+  scenario priorpoc_trust_is_the_extension_beyond_the_prior_poc_over_its_40_tick_stop {
+    given: "price 7740 with prior POC 7732.50 and the Short setup's 10-point stop"
+    when: "priorpoc::trust runs"
+    then: "0.875 (7.5 of 10 points extended)"
+    # delegates: priorpoc::tests::priorpoc_trust_is_the_extension_beyond_the_prior_poc_over_its_40_tick_stop
+  }
+  scenario a_60_percent_value_area_is_cut_from_the_same_ticks {
+    given: "a fully recorded session whose 70% value area is 100.00-100.50"
+    when: "levels::rth_levels_from_ticks_pct runs with 60"
+    then: "same POC 100.25, value area 100.00-100.25"
+    # delegates: levels::tests::a_60_percent_value_area_is_cut_from_the_same_ticks
+  }
+  scenario a_partly_recorded_session_gives_no_60_percent_levels {
+    given: "a recording that starts at 09:10"
+    when: "rth_levels_from_ticks_pct runs with 60"
+    then: "no levels"
+    # delegates: levels::tests::a_partly_recorded_session_gives_no_60_percent_levels
+  }
+  scenario above_the_prior_poc_it_sells_with_a_40_tick_stop_and_2r_target {
+    given: "prior RTH POC 7732.50, VAH 7745.00, VAL 7722.75 and price 7740"
+    when: "priorpoc::setup runs"
+    then: "Short at trade_setup's VAH entry 7746.50, stop 10 points above, target 20 points below"
+    # delegates: priorpoc::tests::above_the_prior_poc_it_sells_with_a_40_tick_stop_and_2r_target
+  }
+  scenario below_the_prior_poc_it_buys_with_a_40_tick_stop {
+    given: "the same profile and price 7728"
+    when: "priorpoc::setup runs"
+    then: "Long at 7721.25, stop 10 points below, target 20 points above"
+    # delegates: priorpoc::tests::below_the_prior_poc_it_buys_with_a_40_tick_stop
+  }
+  scenario a_stopped_level_is_not_retaken_by_priorpoc {
+    given: "a Short at 7746.50 stopped out earlier today"
+    when: "priorpoc::setup runs at 7740 again"
+    then: "no setup, naming the stopped level"
+    # delegates: priorpoc::tests::a_stopped_level_is_not_retaken_by_priorpoc
+  }
+  scenario it_trades_only_from_08_30_to_15_00 {
+    given: "Chicago times 08:29:59, 08:30, 14:59:59, 15:00, 20:00"
+    when: "priorpoc::in_rth runs"
+    then: "false, true, true, false, false"
+    # delegates: priorpoc::tests::it_trades_only_from_08_30_to_15_00
+  }
+  scenario at_15_00_an_entered_trade_closes_at_the_last_rth_price {
+    given: "an entered Short from 7746.50 and a last RTH price of 7740.00"
+    when: "priorpoc::close_at_rth_end runs"
+    then: "Expired, exit 7740.00, +26 ticks"
+    # delegates: priorpoc::tests::at_15_00_an_entered_trade_closes_at_the_last_rth_price
+  }
+  scenario at_15_00_a_pending_setup_expires {
+    given: "a pending Long"
+    when: "priorpoc::close_at_rth_end runs"
+    then: "Expired with no exit price"
+    # delegates: priorpoc::tests::at_15_00_a_pending_setup_expires
+  }
+}

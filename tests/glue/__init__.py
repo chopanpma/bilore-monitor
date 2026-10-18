@@ -425,3 +425,40 @@ def silence_while_closed_never_alerts():
 
 def feed_messages_say_since_when_and_what_to_check():
     _delegate('telegram::tests::feed_messages_say_since_when_and_what_to_check')
+
+
+# --- MON-016 (fade-priorpoc-2r, 2026-10-18) ---------------------------------
+def a_60_percent_value_area_is_cut_from_the_same_ticks():
+    _delegate('levels::tests::a_60_percent_value_area_is_cut_from_the_same_ticks')
+
+
+def a_partly_recorded_session_gives_no_60_percent_levels():
+    _delegate('levels::tests::a_partly_recorded_session_gives_no_60_percent_levels')
+
+
+def above_the_prior_poc_it_sells_with_a_40_tick_stop_and_2r_target():
+    _delegate('priorpoc::tests::above_the_prior_poc_it_sells_with_a_40_tick_stop_and_2r_target')
+
+
+def below_the_prior_poc_it_buys_with_a_40_tick_stop():
+    _delegate('priorpoc::tests::below_the_prior_poc_it_buys_with_a_40_tick_stop')
+
+
+def a_stopped_level_is_not_retaken_by_priorpoc():
+    _delegate('priorpoc::tests::a_stopped_level_is_not_retaken_by_priorpoc')
+
+
+def it_trades_only_from_08_30_to_15_00():
+    _delegate('priorpoc::tests::it_trades_only_from_08_30_to_15_00')
+
+
+def at_15_00_an_entered_trade_closes_at_the_last_rth_price():
+    _delegate('priorpoc::tests::at_15_00_an_entered_trade_closes_at_the_last_rth_price')
+
+
+def at_15_00_a_pending_setup_expires():
+    _delegate('priorpoc::tests::at_15_00_a_pending_setup_expires')
+
+
+def priorpoc_trust_is_the_extension_beyond_the_prior_poc_over_its_40_tick_stop():
+    _delegate('priorpoc::tests::priorpoc_trust_is_the_extension_beyond_the_prior_poc_over_its_40_tick_stop')

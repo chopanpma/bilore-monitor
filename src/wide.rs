@@ -26,6 +26,18 @@ pub fn wide_setup(
     stopped: &[(Direction, Decimal)],
     cfg: &TradeSetupConfig,
 ) -> Result<GlobexSetup, String> {
+    prior_poc_setup(geometry(), price, prior, stopped, cfg)
+}
+
+/// Today's prior-POC fade entry with `geometry`'s stop and target — shared
+/// by fade-poc-wide and fade-priorpoc-2r (`priorpoc`).
+pub fn prior_poc_setup(
+    geometry: Geometry,
+    price: Decimal,
+    prior: &ProfileLevels,
+    stopped: &[(Direction, Decimal)],
+    cfg: &TradeSetupConfig,
+) -> Result<GlobexSetup, String> {
     let direction = fade_direction(price, prior.poc);
     let s = match trade_setup(direction, price, prior, &ungated_risk(direction), None, cfg) {
         SetupResult::Setup(s) => s,
@@ -35,7 +47,7 @@ pub fn wide_setup(
         return Err(format!("{direction:?} at {} was stopped out earlier today", s.entry_price));
     }
     let (stop, target) =
-        apply_geometry(geometry(), direction, s.entry_price, s.stop, s.targets.first().map(|t| t.price), cfg.tick_size);
+        apply_geometry(geometry, direction, s.entry_price, s.stop, s.targets.first().map(|t| t.price), cfg.tick_size);
     Ok(GlobexSetup { direction, anchor: s.anchor_lbl, entry: s.entry_price, stop, target: target.ok_or("no target")? })
 }
 

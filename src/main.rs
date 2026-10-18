@@ -59,7 +59,7 @@ use bilore_core::volatility::{Baseline, Release, CALENDAR_UNAVAILABLE};
 use bilore_monitor::feed_watch::{FeedNotice, FeedWatch};
 use bilore_monitor::va_alert;
 use bilore_monitor::vol_gate::{Notice, VolGate};
-use bilore_monitor::{daily_summary, db, globex, levels, sound, telegram, wide};
+use bilore_monitor::{daily_summary, db, globex, levels, priorpoc, sound, telegram, wide};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use chrono_tz::America::Chicago;
 use ndarray::Array1;
@@ -276,7 +276,7 @@ fn summary_request(args: &[String], today: NaiveDate) -> std::result::Result<Opt
 }
 
 /// MON-014-R3: the strategies the daily summary lists — the active ones.
-const SUMMARY_STRATEGIES: [&str; 4] = strategy::ACTIVE;
+const SUMMARY_STRATEGIES: [&str; strategy::ACTIVE.len()] = strategy::ACTIVE;
 
 struct TrainedModel {
     models: Vec<LogisticModel>, // [p_bullish, p_break_vah, p_break_val, p_return_poc]
@@ -353,6 +353,16 @@ struct PerSymbolState {
     /// `fade-poc-wide` slot (2026-10-12, MON-014): fade-poc-fill's entries,
     /// 80-tick stop / 2R target, RTH only — see `bilore_monitor::wide`.
     wide: StrategySlot,
+    /// `fade-priorpoc-2r` slot (2026-10-18, MON-016): fade-poc-wide's entries
+    /// against a 60% prior value area, 40-tick stop / 2R target, RTH only,
+    /// closed at 15:00 — see `bilore_monitor::priorpoc`.
+    priorpoc: StrategySlot,
+    /// fade-priorpoc-2r's prior RTH levels (60% value area, recorded ticks
+    /// only); `None` = no setups today.
+    priorpoc_prior: Option<ProfileLevels>,
+    /// Last RTH trade price this session — where an entered fade-priorpoc-2r
+    /// trade is closed at 15:00, like the sweep.
+    rth_last: Option<Decimal>,
     /// Volatility gate (bilore-specs SYS-006, 2026-10-04): no NEW setups
     /// during releases, the opens and 30-second spikes. Fed every tick.
     vol: VolGate,
@@ -513,6 +523,22 @@ async fn fetch_prior_session(
     Ok(row.map(|(poc, vah, val)| ProfileLevels { poc, vah, val, ib_high: None, ib_low: None }))
 }
 
+/// MON-016: the prior RTH session's levels with a `pct`% value area, from
+/// the recorded ticks only — no `session_profiles` fallback (that row is
+/// the 70% value area, and the sweep only used fully recorded sessions).
+async fn fetch_prior_rth_pct(pool: &PgPool, symbol: &str, before: NaiveDate, pct: u64) -> Result<Option<ProfileLevels>> {
+    let Some((day, rows, first, last)) = db::last_rth_volume_profile(pool, symbol, before).await? else {
+        tracing::warn!("{symbol}: no recorded prior RTH — no {} setups", strategy::FADE_PRIORPOC_2R);
+        return Ok(None);
+    };
+    let levels = levels::rth_levels_from_ticks_pct(&rows, first, last, pct);
+    match &levels {
+        Some(l) => tracing::info!("{symbol}: prior RTH {day} {pct}% value area — POC {} VAH {} VAL {}", l.poc, l.vah, l.val),
+        None => tracing::warn!("{symbol}: RTH {day} not fully recorded ({first}-{last}) — no {} setups", strategy::FADE_PRIORPOC_2R),
+    }
+    Ok(levels)
+}
+
 /// Prior session's own RTH high/low (2026-09-16) — same "most recent
 /// session before `before`, with `bridge_from` fallback" shape as
 /// `fetch_prior_session`, but from `historical_bars` since neither
@@ -583,6 +609,7 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
     };
     let (ml, fade, fade_fill) = (slot(strategy::ML_MODEL), slot(strategy::FADE_POC), slot(strategy::FADE_POC_FILL));
     let wide = slot(strategy::FADE_POC_WIDE);
+    let priorpoc = slot(strategy::FADE_PRIORPOC_2R);
 
     // fade-poc-globex rows live under their Globex session's trading date
     // (the next trading day after 17:00), not necessarily today_ct.
@@ -629,7 +656,7 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
         }
         roll.push(RollSlot { cfg, slot, key });
     }
-    for (slug, s) in [(strategy::ML_MODEL, &ml), (strategy::FADE_POC, &fade), (strategy::FADE_POC_FILL, &fade_fill), (strategy::FADE_POC_WIDE, &wide)] {
+    for (slug, s) in [(strategy::ML_MODEL, &ml), (strategy::FADE_POC, &fade), (strategy::FADE_POC_FILL, &fade_fill), (strategy::FADE_POC_WIDE, &wide), (strategy::FADE_PRIORPOC_2R, &priorpoc)] {
         if let Some(ot) = &s.open {
             tracing::info!("{symbol}: restored open [{slug}] trade #{} ({:?})", ot.db_id, ot.trade.outcome);
         }
@@ -663,6 +690,9 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
         vol: VolGate::new(load_vol_baseline(pool, symbol, today_ct).await, None),
         va: VaState::default(),
         wide,
+        priorpoc,
+        priorpoc_prior: fetch_prior_rth_pct(pool, symbol, today_ct, priorpoc::VA_PCT).await?,
+        rth_last: None,
         feed: FeedWatch::default(),
     })
 }
@@ -939,6 +969,16 @@ async fn main() -> Result<()> {
                 state.fade = StrategySlot::default();
                 state.fade_fill = StrategySlot::default();
                 state.wide = StrategySlot::default();
+                // fade-priorpoc-2r normally closed at 15:00; anything left
+                // (down across the close) expires.
+                if let Some(mut ot) = state.priorpoc.open.take() {
+                    if shadow_trader::close(&mut ot.trade) {
+                        let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
+                    }
+                }
+                state.priorpoc = StrategySlot::default();
+                state.priorpoc_prior = fetch_prior_rth_pct(&pool, symbol, now_ct, priorpoc::VA_PCT).await.unwrap_or(None);
+                state.rth_last = None;
                 state.vol.set_baseline(load_vol_baseline(&pool, symbol, now_ct).await);
                 match train(&pool, symbol, bf.as_deref()).await {
                     Ok(t) => state.trained = t,
@@ -1158,12 +1198,43 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                // fade-priorpoc-2r (MON-016): flip invalidation against its own
+                // prior POC, then the 15:00 close — before the advance below
+                // so neither a flipped setup nor a closed trade moves on this tick.
+                if priorpoc::in_rth(tick_ct.time()) {
+                    state.rth_last = Some(tick.price);
+                }
+                if let Some(prior) = state.priorpoc_prior {
+                    let buffer = flip_buffer_ticks * state.tick_size;
+                    let dir = fade::fade_direction(tick.price, prior.poc);
+                    let held = state.priorpoc.open.as_ref().filter(|ot| ot.sees(tick.ts)).map(|ot| ot.trade.direction);
+                    if held.is_some_and(|h| fade::fade_flipped(h, tick.price, prior.poc, buffer)) {
+                        if let Some(ot) = state.priorpoc.invalidate_on_direction_flip(dir) {
+                            let why = format!(
+                                "price {} crossed prior POC {} by more than {flip_buffer_ticks} ticks — fade now {}",
+                                tick.price, prior.poc, dir_upper(dir)
+                            );
+                            report_invalidated(&pool, symbol, strategy::FADE_PRIORPOC_2R, &ot, &why).await;
+                        }
+                    }
+                }
+                if !priorpoc::in_rth(tick_ct.time()) {
+                    if let Some(mut ot) = state.priorpoc.open.take_if(|ot| ot.sees(tick.ts)) {
+                        let mark = state.rth_last.unwrap_or(tick.price);
+                        if priorpoc::close_at_rth_end(&mut ot.trade, mark, state.tick_size, state.tick_value) {
+                            let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
+                            tracing::info!("{symbol}: [{}] #{} closed at the RTH end ({mark})", strategy::FADE_PRIORPOC_2R, ot.db_id);
+                        }
+                    }
+                }
+
                 let fixed_slots = [
                     (&mut state.ml, strategy::ML_MODEL),
                     (&mut state.fade, strategy::FADE_POC),
                     (&mut state.fade_fill, strategy::FADE_POC_FILL),
                     (&mut state.globex, strategy::FADE_POC_GLOBEX),
                     (&mut state.wide, strategy::FADE_POC_WIDE),
+                    (&mut state.priorpoc, strategy::FADE_PRIORPOC_2R),
                 ];
                 let roll_slots = state.roll.iter_mut().map(|r| (&mut r.slot, r.cfg.slug));
                 for (slot, slug) in fixed_slots.into_iter().chain(roll_slots) {
@@ -1215,6 +1286,18 @@ async fn main() -> Result<()> {
                     if let Some(prior) = state.prior {
                         state.wide.last_checked_price = Some(tick.price);
                         try_wide_signal(&pool, symbol, &setup_cfg, tick.price, prior, state).await;
+                    }
+                }
+                // MON-016: fade-priorpoc-2r, RTH only, its own 60% prior levels.
+                if live
+                    && strategy::is_active(strategy::FADE_PRIORPOC_2R)
+                    && priorpoc::in_rth(tick_ct.time())
+                    && state.priorpoc.last_checked_price != Some(tick.price)
+                    && gate_allows(&mut state.priorpoc, &state.vol, tick_ct, symbol, strategy::FADE_PRIORPOC_2R)
+                {
+                    if let Some(prior) = state.priorpoc_prior {
+                        state.priorpoc.last_checked_price = Some(tick.price);
+                        try_priorpoc_signal(&pool, symbol, &setup_cfg, tick.price, prior, state).await;
                     }
                 }
                 if live
@@ -1388,7 +1471,7 @@ async fn send_daily_summary(
     day: NaiveDate,
     roots: &[&str],
 ) {
-    const STRATEGIES: [&str; 4] = SUMMARY_STRATEGIES;
+    const STRATEGIES: [&str; SUMMARY_STRATEGIES.len()] = SUMMARY_STRATEGIES;
     let week = db::fetch_summary_rows(pool, daily_summary::week_start(day), day, roots).await;
     let resolved = db::fetch_resolved_gate_rows(pool, roots).await;
     let (week, resolved) = match (week, resolved) {
@@ -1435,6 +1518,42 @@ async fn try_wide_signal(
     tracing::info!(
         "{symbol} LOCKED [{}]: {:?} entry={} stop={} (80 ticks) target={} (2R) (prior RTH POC={}, anchor {})",
         strategy::FADE_POC_WIDE, setup.direction, setup.entry, setup.stop, setup.target, prior.poc, setup.anchor
+    );
+}
+
+/// Arm a `fade-priorpoc-2r` setup at `price` (MON-016, `bilore_monitor::priorpoc`):
+/// a Pending trade (fill required) stored under today's date.
+async fn try_priorpoc_signal(
+    pool: &PgPool,
+    symbol: &str,
+    setup_cfg: &TradeSetupConfig,
+    price: Decimal,
+    prior: ProfileLevels,
+    state: &mut PerSymbolState,
+) {
+    let setup = match priorpoc::setup(price, &prior, &state.priorpoc.stopped, setup_cfg) {
+        Ok(s) => s,
+        Err(reason) => {
+            if state.priorpoc.last_logged_reason.as_deref() != Some(reason.as_str()) {
+                tracing::debug!("{symbol}: no {} setup: {reason}", strategy::FADE_PRIORPOC_2R);
+                state.priorpoc.last_logged_reason = Some(reason);
+            }
+            return;
+        }
+    };
+    let trade = ShadowTrade::new(setup.direction, setup.entry, setup.entry, setup.stop, Some(setup.target), 1, true);
+    let trust = priorpoc::trust(price, &prior, &setup);
+    match db::insert_shadow_trade_v2(pool, state.today_ct, symbol, strategy::FADE_PRIORPOC_2R, Some(trust), &trade).await {
+        Ok(id) => state.priorpoc.open = Some(OpenTrade { db_id: id, trade, trust, since: Utc::now() }),
+        Err(e) => {
+            tracing::error!("{symbol}: insert_shadow_trade_v2 ({}) failed, setup not tracked: {e}", strategy::FADE_PRIORPOC_2R);
+            return;
+        }
+    }
+    // MON-012: setups are logged, not sent to Telegram.
+    tracing::info!(
+        "{symbol} LOCKED [{}]: {:?} entry={} stop={} (40 ticks) target={} (2R) (prior RTH POC={}, 60% VA {}-{}, anchor {}, trust {:.0}%)",
+        strategy::FADE_PRIORPOC_2R, setup.direction, setup.entry, setup.stop, setup.target, prior.poc, prior.val, prior.vah, setup.anchor, trust * 100.0
     );
 }
 
