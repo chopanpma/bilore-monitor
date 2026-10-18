@@ -574,7 +574,12 @@ async fn fetch_pf_prior(pool: &PgPool, symbol: &str, before: NaiveDate) -> Resul
         levels::rth_levels_from_ticks_pct(&rows, first, last, pct)
             .map(|l| bilore_ml_rs::poc_anchor::Profile3 { poc: l.poc, vah: l.vah, val: l.val })
     };
-    Ok(at(60).zip(at(70)).map(|(p60, p70)| PfPrior { day, p60, p70 }))
+    let prior = at(60).zip(at(70)).map(|(p60, p70)| PfPrior { day, p60, p70 });
+    match &prior {
+        Some(p) => tracing::info!("{symbol}: profile fades prior RTH {day} — 60% POC {} VA {}-{}, 70% VA {}-{}", p.p60.poc, p.p60.val, p.p60.vah, p.p70.val, p.p70.vah),
+        None => tracing::warn!("{symbol}: RTH {day} not fully recorded ({first}-{last}) — no profile-fade setups"),
+    }
+    Ok(prior)
 }
 
 /// Prior session's own RTH high/low (2026-09-16) — same "most recent
