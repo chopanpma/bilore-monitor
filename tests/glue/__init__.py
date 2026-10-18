@@ -493,3 +493,20 @@ def a_complete_session_gives_levels():
 # --- MON-019 (two profile fades retired, 2026-10-18) ------------------------
 def retired_profile_fades_are_not_active():
     _delegate('strategy::tests::deprecated_strategies_are_not_active', target=('-p', 'bilore-core', '--lib'))
+
+
+# --- MON-020 (prior-POC fades only, 2026-10-18) -----------------------------
+def the_complete_session_picks_are_prior_poc_fades():
+    _delegate('profile_fade::tests::the_complete_session_picks_are_prior_poc_fades')
+
+
+def a_prior_poc_fade_ignores_the_developing_profile():
+    _delegate('profile_fade::tests::a_prior_poc_fade_ignores_the_developing_profile')
+
+
+def every_configured_value_area_is_tracked():
+    _delegate('profile_fade::tests::every_configured_value_area_is_tracked')
+
+
+def the_retired_fades_are_not_active():
+    _delegate('strategy::tests::deprecated_strategies_are_not_active', target=('-p', 'bilore-core', '--lib'))

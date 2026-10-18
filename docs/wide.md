@@ -1,5 +1,7 @@
 # wide
 
+**Retired 2026-10-18 (MON-020):** complete sessions only, 40t, −$595, both halves negative. `is_active` is false, so it arms nothing; `prior_poc_setup` is still used by `priorpoc`.
+
 Source: `src/wide.rs` (pure) · wired in `main.rs` (`try_wide_signal`, the per-tick RTH
 block) · New 2026-10-12 (MON-014). Strategy `fade-poc-wide`, registered in
 `bilore-project-conf/contracts/strategies.md` as `fade-poc-fill`'s replacement.

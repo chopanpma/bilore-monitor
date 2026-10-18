@@ -2,7 +2,7 @@
 
 Source: `src/profile_fade.rs` (pure) · wired in `main.rs` (`PfSlot`, `PfPrior`,
 `fetch_pf_prior`, `try_pf_signal`, the per-tick MON-017 block) · New 2026-10-18 (MON-017).
-Five configured strategies, one slot each (two retired 2026-10-18, MON-019: they stay in `configs()` but `is_active` is false), registered in `bilore-project-conf/contracts/strategies.md`.
+Seven configured strategies, one slot each; only those in `strategy::ACTIVE` arm (2026-10-18: the five devpoc/todaylvl rules are retired, MON-019/MON-020; the two prior-POC picks are active), registered in `bilore-project-conf/contracts/strategies.md`.
 
 ## Rule
 
@@ -29,13 +29,19 @@ published number (bilore-ml-rs `docs/findings/2026-10-17-profile-sweep.md`, "Re-
 | `fade-devpoc-live-va` | E+C | 70 | 120t / 0.75R | **yes** | faded POC | 252t, +$2,048 |
 | `fade-devpoc-0930` | C 09:30 | 60 | 120t / 1R | no | faded POC | 175t, +$996 |
 | `fade-todaylvl-0.75r` | E | 60 | 60t / 0.75R | **yes** | nearest today level | 361t, +$834 |
+| `fade-priorpoc-va60-1r` | A | 60 | 60t / 1R | yes | faded (prior) POC | complete sessions (51): 78t, +$545 |
+| `fade-priorpoc-va80-1.5r` | A | 80 | 40t / 1.5R | no | faded (prior) POC | complete sessions (51): 73t, +$605 |
+
+Status 2026-10-18: retired — fade-devpoc-sw, -anchor-2r, -live-va, -0930, fade-todaylvl-0.75r
+(they lose, or lose in H2, on complete sessions; MON-019, MON-020). Active — the two A rows.
 
 ## Function index
 
 | Symbol | Purpose | Tests |
 |---|---|---|
-| `configs()` | The five rules | `the_five_profile_fades_are_the_sweep_winners` |
-| `faded_poc()` | Prior POC until a handoff variant is clear, then the developing one | `a_stable_poc_fade_leans_on_the_prior_poc_until_clear_then_the_developing_one` |
+| `configs()` | The seven rules | `the_five_profile_fades_are_the_sweep_winners`, `the_complete_session_picks_are_prior_poc_fades` |
+| `va_pcts()` | Value-area percents to build prior profiles and trackers for (60, 70, 80) | `every_configured_value_area_is_tracked` |
+| `faded_poc()` | Prior POC until a handoff variant is clear, then the developing one; always the prior POC for A | `a_stable_poc_fade_leans_on_the_prior_poc_until_clear_then_the_developing_one`, `a_prior_poc_fade_ignores_the_developing_profile` |
 | `setup()` | `poc_anchor::arm` with the faded POC's direction | same + `todays_levels_add_entry_anchors` |
 | `trust()` | Registry entry trust | `profile_fade_trust_follows_the_registry` |
 

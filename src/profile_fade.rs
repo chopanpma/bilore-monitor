@@ -43,7 +43,7 @@ fn rule(variant: Variant, stop_ticks: i64, r: &str, no_retake: bool) -> Rule {
     Rule { variant, geometry, no_retake }
 }
 
-pub fn configs() -> [Config; 5] {
+pub fn configs() -> [Config; 7] {
     use TrustFrom::*;
     [
         Config { slug: strategy::FADE_DEVPOC_SW, va_pct: 60, rule: rule(Variant::CStability, 120, "1", true), trust: FadedPoc },
@@ -51,7 +51,19 @@ pub fn configs() -> [Config; 5] {
         Config { slug: strategy::FADE_DEVPOC_LIVE_VA, va_pct: 70, rule: rule(Variant::EC, 120, "0.75", false), trust: FadedPoc },
         Config { slug: strategy::FADE_DEVPOC_0930, va_pct: 60, rule: rule(Variant::CTime, 120, "1", true), trust: FadedPoc },
         Config { slug: strategy::FADE_TODAYLVL_075R, va_pct: 60, rule: rule(Variant::E, 60, "0.75", false), trust: NearestTodayLevel },
+        // 2026-10-18 complete-session picks (MON-020).
+        Config { slug: strategy::FADE_PRIORPOC_VA60_1R, va_pct: 60, rule: rule(Variant::A, 60, "1", false), trust: FadedPoc },
+        Config { slug: strategy::FADE_PRIORPOC_VA80_15R, va_pct: 80, rule: rule(Variant::A, 40, "1.5", true), trust: FadedPoc },
     ]
+}
+
+/// Every value-area percent a configured fade uses — the monitor builds a
+/// prior profile and a `TodayTracker` for each (MON-020).
+pub fn va_pcts() -> Vec<u64> {
+    let mut pcts: Vec<u64> = configs().iter().map(|c| c.va_pct).collect();
+    pcts.sort_unstable();
+    pcts.dedup();
+    pcts
 }
 
 /// The POC the rule fades right now (prior until a handoff variant is clear).
@@ -122,7 +134,7 @@ mod tests {
     fn the_five_profile_fades_are_the_sweep_winners() {
         let row = |c: &Config| (c.slug, c.rule.variant, c.va_pct, c.rule.geometry.stop_ticks, c.rule.geometry.target, c.rule.no_retake);
         let r = |x: &str| TargetRule::R(d(x));
-        let got: Vec<_> = configs().iter().map(row).collect();
+        let got: Vec<_> = configs()[..5].iter().map(row).collect();
         assert_eq!(
             got,
             vec![
@@ -170,5 +182,38 @@ mod tests {
         assert_eq!(trust(&live_va, d("7766.00"), &today(), &armed), 0.7, "4 of 10 points from the faded POC");
         let anchor_2r = by_slug(strategy::FADE_DEVPOC_ANCHOR_2R);
         assert_eq!(trust(&anchor_2r, d("7766.00"), &today(), &armed), 0.6, "2 of 10 points from IB high 7768");
+    }
+
+    // ---- MON-020 ----
+
+    #[test]
+    fn the_complete_session_picks_are_prior_poc_fades() {
+        let va60 = by_slug(strategy::FADE_PRIORPOC_VA60_1R);
+        let va80 = by_slug(strategy::FADE_PRIORPOC_VA80_15R);
+        let r = |x: &str| TargetRule::R(d(x));
+        assert_eq!(
+            (va60.rule.variant, va60.va_pct, va60.rule.geometry.stop_ticks, va60.rule.geometry.target, va60.rule.no_retake, va60.trust),
+            (Variant::A, 60, Some(d("60")), r("1"), false, TrustFrom::FadedPoc)
+        );
+        assert_eq!(
+            (va80.rule.variant, va80.va_pct, va80.rule.geometry.stop_ticks, va80.rule.geometry.target, va80.rule.no_retake, va80.trust),
+            (Variant::A, 80, Some(d("40")), r("1.5"), true, TrustFrom::FadedPoc)
+        );
+    }
+
+    #[test]
+    fn a_prior_poc_fade_ignores_the_developing_profile() {
+        let va60 = by_slug(strategy::FADE_PRIORPOC_VA60_1R);
+        let cfg = TradeSetupConfig::default();
+        for clear in [false, true] {
+            let a = setup(&va60, prior(), &today(), clear, d("7740.00"), &[], &cfg).unwrap();
+            assert_eq!((a.trade.direction, a.faded_poc, a.anchor.as_str()), (Direction::Short, d("7732.50"), "VAH"));
+            assert_eq!((a.trade.entry_lo, a.trade.stop, a.trade.target_1), (d("7746.50"), d("7761.50"), Some(d("7731.50"))));
+        }
+    }
+
+    #[test]
+    fn every_configured_value_area_is_tracked() {
+        assert_eq!(va_pcts(), vec![60, 70, 80]);
     }
 }

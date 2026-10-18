@@ -291,18 +291,18 @@ struct PfSlot {
     slot: StrategySlot,
 }
 
-/// MON-017: the prior RTH session's profile at 60% and 70% (recorded ticks
-/// only) and the day it is from (the overnight range starts at its 15:00).
-#[derive(Clone, Copy)]
+/// MON-017/MON-020: the prior RTH session's profile at every value-area
+/// percent a profile fade uses (recorded ticks only) and the day it is from
+/// (the overnight range starts at its 15:00).
+#[derive(Clone)]
 struct PfPrior {
     day: NaiveDate,
-    p60: bilore_ml_rs::poc_anchor::Profile3,
-    p70: bilore_ml_rs::poc_anchor::Profile3,
+    by_pct: Vec<(u64, bilore_ml_rs::poc_anchor::Profile3)>,
 }
 
 impl PfPrior {
-    fn at(&self, pct: u64) -> bilore_ml_rs::poc_anchor::Profile3 {
-        if pct == 70 { self.p70 } else { self.p60 }
+    fn at(&self, pct: u64) -> Option<bilore_ml_rs::poc_anchor::Profile3> {
+        self.by_pct.iter().find(|(p, _)| *p == pct).map(|(_, prof)| *prof)
     }
 }
 
@@ -574,9 +574,13 @@ async fn fetch_pf_prior(pool: &PgPool, symbol: &str, before: NaiveDate) -> Resul
         levels::rth_levels_from_ticks_pct(&rows, first, last, minutes, pct)
             .map(|l| bilore_ml_rs::poc_anchor::Profile3 { poc: l.poc, vah: l.vah, val: l.val })
     };
-    let prior = at(60).zip(at(70)).map(|(p60, p70)| PfPrior { day, p60, p70 });
+    let by_pct: Option<Vec<_>> = profile_fade::va_pcts().into_iter().map(|pct| at(pct).map(|p| (pct, p))).collect();
+    let prior = by_pct.map(|by_pct| PfPrior { day, by_pct });
     match &prior {
-        Some(p) => tracing::info!("{symbol}: profile fades prior RTH {day} — 60% POC {} VA {}-{}, 70% VA {}-{}", p.p60.poc, p.p60.val, p.p60.vah, p.p70.val, p.p70.vah),
+        Some(p) => {
+            let vas: Vec<String> = p.by_pct.iter().map(|(pct, l)| format!("{pct}% VA {}-{}", l.val, l.vah)).collect();
+            tracing::info!("{symbol}: profile fades prior RTH {day} — POC {} — {}", p.by_pct[0].1.poc, vas.join(", "));
+        }
         None => tracing::warn!("{symbol}: RTH {day} not fully recorded ({first}-{last}, {minutes}/390 minutes) — no profile-fade setups"),
     }
     Ok(prior)
@@ -1295,14 +1299,15 @@ async fn main() -> Result<()> {
                 // invalidation against each rule's faded POC and the 15:00 close.
                 if priorpoc::in_rth(tick_ct.time()) {
                     if state.pf_trackers.is_empty() {
-                        if let Some(p) = state.pf_prior {
+                        if let Some(p) = &state.pf_prior {
                             let on = db::price_range(&pool, symbol, p.day.and_hms_opt(15, 0, 0).unwrap(), tick_ct.date().and_hms_opt(8, 30, 0).unwrap())
                                 .await
                                 .unwrap_or(None);
                             let buffer = flip_buffer_ticks * state.tick_size;
-                            state.pf_trackers = [60, 70]
+                            state.pf_trackers = profile_fade::va_pcts()
+                                .into_iter()
                                 .map(|pct| (pct, bilore_ml_rs::poc_anchor::TodayTracker::new(pct, on.map(|r| r.0), on.map(|r| r.1), buffer)))
-                                .to_vec();
+                                .collect();
                             tracing::info!("{symbol}: profile fades tracking RTH {} (prior {}, overnight {:?})", tick_ct.date(), p.day, on);
                         }
                     }
@@ -1310,12 +1315,13 @@ async fn main() -> Result<()> {
                         k.on_tick(tick_ct.time(), tick.price, tick.size.max(0) as u64);
                     }
                 }
-                if let Some(p) = state.pf_prior {
+                if let Some(p) = &state.pf_prior {
                     let buffer = flip_buffer_ticks * state.tick_size;
                     for ps in &mut state.pf {
                         let Some((_, k)) = state.pf_trackers.iter().find(|(pct, _)| *pct == ps.cfg.va_pct) else { continue };
+                        let Some(prior) = p.at(ps.cfg.va_pct) else { continue };
                         let clear = k.clear(ps.cfg.rule.variant);
-                        let poc = profile_fade::faded_poc(&ps.cfg, p.at(ps.cfg.va_pct), k.today(), clear);
+                        let poc = profile_fade::faded_poc(&ps.cfg, prior, k.today(), clear);
                         let held = ps.slot.open.as_ref().filter(|ot| ot.sees(tick.ts)).map(|ot| ot.trade.direction);
                         if held.is_some_and(|h| fade::fade_flipped(h, tick.price, poc, buffer)) {
                             if let Some(ot) = ps.slot.invalidate_on_direction_flip(fade::fade_direction(tick.price, poc)) {
@@ -1412,7 +1418,7 @@ async fn main() -> Result<()> {
                 }
                 // MON-017: each profile fade arms independently.
                 if live && priorpoc::in_rth(tick_ct.time()) {
-                    if let Some(p) = state.pf_prior {
+                    if let Some(p) = state.pf_prior.clone() {
                         for i in 0..state.pf.len() {
                             let cfg = state.pf[i].cfg;
                             if !strategy::is_active(cfg.slug)
@@ -1422,9 +1428,10 @@ async fn main() -> Result<()> {
                                 continue;
                             }
                             let Some((_, k)) = state.pf_trackers.iter().find(|(pct, _)| *pct == cfg.va_pct) else { continue };
+                            let Some(prior) = p.at(cfg.va_pct) else { continue };
                             let (today, clear) = (*k.today(), k.clear(cfg.rule.variant));
                             state.pf[i].slot.last_checked_price = Some(tick.price);
-                            try_pf_signal(&pool, symbol, &setup_cfg, tick.price, p.at(cfg.va_pct), &today, clear, state.today_ct, &mut state.pf[i]).await;
+                            try_pf_signal(&pool, symbol, &setup_cfg, tick.price, prior, &today, clear, state.today_ct, &mut state.pf[i]).await;
                         }
                     }
                 }

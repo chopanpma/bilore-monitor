@@ -535,3 +535,29 @@ sequenceDiagram
 | --- | --- | --- | --- |
 | retired_profile_fades_are_not_active | MON-019-R1 | unit | Given the deprecated slugs, including fade-devpoc-anchor-2r and fade-todaylvl-0.75r (2026-10-18), when strategy::is_active runs for each, then false. |
 
+## MON-020 — Shadow keeps only the prior-POC fades: fade-poc-wide and three devpoc fades retire, fade-priorpoc-va60-1r and fade-priorpoc-va80-1.5r join
+
+**Status:** accepted
+
+**Context:** User decision 2026-10-18 after the full sweep on the 51 complete sessions (bilore-ml-rs docs/findings/2026-10-18-profile-sweep-complete.md). Robust all-fills combos cluster in variant A (today's prior-POC rule): 22/240, against 0-3 for the developing-POC variants. Retired: fade-poc-wide (40t, -$595, both halves negative), fade-devpoc-sw (+$1,751, H2 -$565), fade-devpoc-live-va (+$520, H2 -$429), fade-devpoc-0930 (+$1,064, H2 -$538). Added as profile_fade config rows (variant A, so the faded POC and the levels are the prior session's): fade-priorpoc-va60-1r, VA 60, 60t, 1R, re-take allowed (78t, +$545, H1 +$325 / H2 +$220); fade-priorpoc-va80-1.5r, VA 80, 40t, 1.5R, no re-take (73t, +$605, +$255 / +$350). The monitor builds the prior profile and today's tracker for every value-area percent a config uses (60, 70, 80), not a fixed 60/70.
+
+**Consequences:** + shadow concentrates on the only region with many robust neighbours. + new prior-POC variants are a config row. - 51 sessions; some robust combos are luck. - three prior-POC rules with overlapping entries will often trade together.
+
+### Requirements
+
+| ID | Requirement |
+| --- | --- |
+| MON-020-R1 | WHEN the profile fades are configured THEN they SHALL include fade-priorpoc-va60-1r (A, VA 60, 60t, 1R, re-take) and fade-priorpoc-va80-1.5r (A, VA 80, 40t, 1.5R, no re-take), trust from the faded POC |
+| MON-020-R2 | WHEN a variant-A profile fade arms THEN it SHALL fade the prior POC from the prior profile's levels whether or not today's POC is clear |
+| MON-020-R3 | WHEN the monitor builds prior profiles and today's trackers THEN it SHALL build one for every value-area percent a configured fade uses |
+| MON-020-R4 | WHEN a retired strategy would arm THEN it SHALL not, because strategy::is_active is false for fade-poc-wide, fade-devpoc-sw, fade-devpoc-live-va and fade-devpoc-0930 |
+
+### Scenarios
+
+| ID | Requirement | Layer | Scenario |
+| --- | --- | --- | --- |
+| the_complete_session_picks_are_prior_poc_fades | MON-020-R1 | unit | Given profile_fade::configs, when the two 2026-10-18 picks are read, then variant A, VA 60 / 60t / 1R / re-take and VA 80 / 40t / 1.5R / no re-take, trust FadedPoc. |
+| a_prior_poc_fade_ignores_the_developing_profile | MON-020-R2 | unit | Given prior POC 7732.50 and a clear developing POC 7770, price 7740, when fade-priorpoc-va60-1r arms, then Short against 7732.50 at a prior-profile level, 15-point stop, 15-point target. |
+| every_configured_value_area_is_tracked | MON-020-R3 | unit | Given the configs, when profile_fade::va_pcts runs, then 60, 70, 80. |
+| the_retired_fades_are_not_active | MON-020-R4 | unit | Given the deprecated slugs, when strategy::is_active runs, then false. |
+
