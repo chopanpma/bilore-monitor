@@ -1110,3 +1110,40 @@ spec MON-020 {
     # delegates: strategy::tests::deprecated_strategies_are_not_active (bilore-core)
   }
 }
+
+decision MON-021 "When the monitor records a shadow trade for a strategy listed in [execution], it publishes the order intent if bilore-core's execution gate allows it (bilore-specs SYS-009-R1)" {
+  status: accepted
+  context: "User, 2026-10-18: build execution and put the recommended strategies on paper. The monitor is where the shadow trade is born, so it is where the order intent is decided: after each successful insert it reads bilore-ml/config/trading_rules.toml ([execution] mode/strategies/account_daily_loss_cap_usd, [daily_loss_cap], [platform.ib_tws] autotrade_enabled), the kill-switch flag file (~/.config/bilore/kill_switch, the cockpit toggles it), today's realized dollars per strategy from live_orders in that mode, the strategy's go-live gate (live mode only) and the volatility gate, and calls bilore_core::execution::may_execute. Allowed: OrderIntent::new_order is published on bilore.order.intent through JetStream (stream BILORE_ORDERS, created if missing) and logged; refused: one log line with the reason. The config is re-read on every decision, so editing it needs no restart. Follow-ups are not sent: the executor follows the shadow row's outcome in the database (SYS-009-R3). The strategy cap uses SYS-001's book with Mode::Live semantics in both modes; the book lives in memory, so a restart re-enables a capped strategy."
+  consequences: "+ the order and the shadow trade are the same decision. + a config edit or the kill switch takes effect on the next trade. - a failed publish leaves that trade shadow-only (logged). - the in-memory strategy cap resets on restart."
+}
+
+spec MON-021 {
+  requirement MON-021-R1 (EARS) {
+    text: "WHEN the trading rules are read THEN the execution config SHALL be [execution] mode, strategies and account_daily_loss_cap_usd, with autotrade from [platform.ib_tws] and the strategy caps from [daily_loss_cap]; a missing [execution] SHALL mean mode off"
+    layers: [unit]
+    scenarios: [execution_config_is_read_from_trading_rules, missing_execution_section_means_off]
+  }
+  requirement MON-021-R2 (EARS) {
+    text: "WHEN a shadow trade is recorded for a listed strategy THEN the checks SHALL use that strategy's and the account's realized dollars today in the configured mode, the strategy cap from [daily_loss_cap], the kill-switch file, and the go-live gate only in live mode"
+    layers: [unit]
+    scenarios: [checks_use_todays_realized_dollars_and_the_caps]
+  }
+  scenario execution_config_is_read_from_trading_rules {
+    given: "a trading_rules.toml with mode paper, two strategies, cap 100, autotrade false, MES cap 100"
+    when: "exec::read_config runs"
+    then: "Paper, the two slugs, Some(100), autotrade false, MES -> 100"
+    # delegates: exec::tests::execution_config_is_read_from_trading_rules
+  }
+  scenario missing_execution_section_means_off {
+    given: "a trading_rules.toml without [execution]"
+    when: "exec::read_config runs"
+    then: "mode Off, no strategies, no account cap"
+    # delegates: exec::tests::missing_execution_section_means_off
+  }
+  scenario checks_use_todays_realized_dollars_and_the_caps {
+    given: "realized today: va60 -100, va80 -20; MES cap 100"
+    when: "exec::checks runs for va60 and for va80"
+    then: "va60 refused by its own cap; va80 allowed by its own cap; account realized -120 for both"
+    # delegates: exec::tests::checks_use_todays_realized_dollars_and_the_caps
+  }
+}

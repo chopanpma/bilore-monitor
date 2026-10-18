@@ -59,7 +59,7 @@ use bilore_core::volatility::{Baseline, Release, CALENDAR_UNAVAILABLE};
 use bilore_monitor::feed_watch::{FeedNotice, FeedWatch};
 use bilore_monitor::va_alert;
 use bilore_monitor::vol_gate::{Notice, VolGate};
-use bilore_monitor::{daily_summary, db, globex, levels, priorpoc, profile_fade, sound, telegram, wide};
+use bilore_monitor::{daily_summary, db, exec, globex, levels, priorpoc, profile_fade, sound, telegram, wide};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use chrono_tz::America::Chicago;
 use ndarray::Array1;
@@ -874,7 +874,10 @@ async fn main() -> Result<()> {
 
     let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
     let nats = match async_nats::connect(&nats_url).await {
-        Ok(nc) => Some(nc),
+        Ok(nc) => {
+            let _ = EXEC_NATS.set(nc.clone()); // MON-021 order intents
+            Some(nc)
+        }
         Err(e) => {
             tracing::warn!("NATS connect failed ({e}) — live model state won't be published");
             None
@@ -1656,6 +1659,91 @@ async fn try_wide_signal(
     );
 }
 
+/// MON-021: the NATS client order intents go out on (set at startup).
+static EXEC_NATS: std::sync::OnceLock<async_nats::Client> = std::sync::OnceLock::new();
+/// MON-021: SYS-001's per-strategy cap book for executed strategies (in memory).
+static EXEC_BOOK: std::sync::OnceLock<std::sync::Mutex<bilore_core::loss_cap::LossCapBook>> = std::sync::OnceLock::new();
+
+fn trading_rules_path() -> std::path::PathBuf {
+    std::env::var("BILORE_TRADING_RULES").map(Into::into).unwrap_or_else(|_| {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../bilore-ml/config/trading_rules.toml")
+    })
+}
+
+/// MON-021 (SYS-009-R1): after a shadow trade is recorded, publish it as an
+/// order intent if `[execution]` lists the strategy and bilore-core's gate
+/// allows it. The config and the kill switch are re-read every time. The
+/// volatility block is always clear here: a setup is only created after
+/// `gate_allows` passed on this same tick.
+async fn maybe_execute(pool: &PgPool, symbol: &str, slug: &str, trade_id: i64, trade: &ShadowTrade) {
+    use bilore_core::execution::{may_execute, ExecMode, OrderIntent, INTENT_SUBJECT};
+    let settings = match std::fs::read_to_string(trading_rules_path()).map_err(|e| e.to_string()).and_then(|t| exec::read_config(&t)) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("{symbol}: [{slug}] #{trade_id} not executed — trading rules unreadable: {e}");
+            return;
+        }
+    };
+    if settings.exec.mode == ExecMode::Off || !settings.exec.strategies.iter().any(|s| s == slug) {
+        return;
+    }
+    let mode_name = if settings.exec.mode == ExecMode::Live { "live" } else { "paper" };
+    let today = Utc::now().with_timezone(&Chicago).date_naive();
+    let realized = match db::realized_today(pool, mode_name, today).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("{symbol}: [{slug}] #{trade_id} not executed — live_orders unreadable: {e}");
+            return;
+        }
+    };
+    let gate_passed = settings.exec.mode == ExecMode::Live
+        && match db::fetch_resolved_gate_rows(pool, &["MES"]).await {
+            Ok(rows) => {
+                let gates = gate::compute_gates(&gate::group_by_strategy(&rows), &[slug], &gate::TRUST_CFG);
+                gates.get(slug).is_some_and(|m| m.meets_threshold)
+            }
+            Err(_) => false,
+        };
+    let kill = exec::kill_switch_path().exists();
+    let checks = {
+        let mut book = EXEC_BOOK.get_or_init(Default::default).lock().unwrap();
+        exec::checks(&settings, slug, symbol, &realized, &mut book, today, gate_passed, false, kill)
+    };
+    let mode = match may_execute(&settings.exec, slug, &checks) {
+        Ok(m) => m,
+        Err(blocked) => {
+            tracing::info!("{symbol}: [{slug}] #{trade_id} stays shadow-only ({mode_name}): {blocked:?}");
+            return;
+        }
+    };
+    let intent = OrderIntent::new_order(mode, trade_id, slug, symbol, trade);
+    let Some(nc) = EXEC_NATS.get() else {
+        tracing::error!("{symbol}: [{slug}] #{trade_id} intent not sent — no NATS connection");
+        return;
+    };
+    let js = async_nats::jetstream::new(nc.clone());
+    let stream = async_nats::jetstream::stream::Config {
+        name: "BILORE_ORDERS".to_string(),
+        subjects: vec!["bilore.order.>".to_string()],
+        ..Default::default()
+    };
+    if let Err(e) = js.get_or_create_stream(stream).await {
+        tracing::error!("{symbol}: [{slug}] #{trade_id} intent not sent — JetStream stream: {e}");
+        return;
+    }
+    let payload = serde_json::to_vec(&intent).unwrap_or_default();
+    match js.publish(INTENT_SUBJECT, payload.into()).await {
+        Ok(ack) => match ack.await {
+            Ok(_) => tracing::info!(
+                "{symbol} INTENT [{slug}] #{trade_id} {mode_name}: {} entry={} stop={} target={:?}",
+                intent.direction, intent.entry, intent.stop, intent.target
+            ),
+            Err(e) => tracing::error!("{symbol}: [{slug}] #{trade_id} intent not acknowledged: {e}"),
+        },
+        Err(e) => tracing::error!("{symbol}: [{slug}] #{trade_id} intent publish failed: {e}"),
+    }
+}
+
 /// Arm a `fade-priorpoc-2r` setup at `price` (MON-016, `bilore_monitor::priorpoc`):
 /// a Pending trade (fill required) stored under today's date.
 async fn try_priorpoc_signal(
@@ -1679,7 +1767,10 @@ async fn try_priorpoc_signal(
     let trade = ShadowTrade::new(setup.direction, setup.entry, setup.entry, setup.stop, Some(setup.target), 1, true);
     let trust = priorpoc::trust(price, &prior, &setup);
     match db::insert_shadow_trade_v2(pool, state.today_ct, symbol, strategy::FADE_PRIORPOC_2R, Some(trust), &trade).await {
-        Ok(id) => state.priorpoc.open = Some(OpenTrade { db_id: id, trade, trust, since: Utc::now() }),
+        Ok(id) => {
+            state.priorpoc.open = Some(OpenTrade { db_id: id, trade, trust, since: Utc::now() });
+            maybe_execute(pool, symbol, strategy::FADE_PRIORPOC_2R, id, &trade).await;
+        }
         Err(e) => {
             tracing::error!("{symbol}: insert_shadow_trade_v2 ({}) failed, setup not tracked: {e}", strategy::FADE_PRIORPOC_2R);
             return;
@@ -1720,7 +1811,10 @@ async fn try_pf_signal(
     let trust = profile_fade::trust(&ps.cfg, price, today, &armed);
     let trade = armed.trade;
     match db::insert_shadow_trade_v2(pool, session_date, symbol, slug, Some(trust), &trade).await {
-        Ok(id) => ps.slot.open = Some(OpenTrade { db_id: id, trade, trust, since: Utc::now() }),
+        Ok(id) => {
+            ps.slot.open = Some(OpenTrade { db_id: id, trade, trust, since: Utc::now() });
+            maybe_execute(pool, symbol, slug, id, &trade).await;
+        }
         Err(e) => {
             tracing::error!("{symbol}: insert_shadow_trade_v2 ({slug}) failed, setup not tracked: {e}");
             return;
@@ -1758,7 +1852,10 @@ async fn try_globex_signal(
     };
     let trade = ShadowTrade::new(setup.direction, setup.entry, setup.entry, setup.stop, Some(setup.target), 1, true);
     match db::insert_shadow_trade_v2(pool, session_date, symbol, strategy::FADE_POC_GLOBEX, None, &trade).await {
-        Ok(id) => state.globex.open = Some(OpenTrade { db_id: id, trade, trust: 0.0, since: Utc::now() }),
+        Ok(id) => {
+            state.globex.open = Some(OpenTrade { db_id: id, trade, trust: 0.0, since: Utc::now() });
+            maybe_execute(pool, symbol, strategy::FADE_POC_GLOBEX, id, &trade).await;
+        }
         Err(e) => {
             tracing::error!("{symbol}: insert_shadow_trade_v2 ({}) failed, setup not tracked: {e}", strategy::FADE_POC_GLOBEX);
             return;
@@ -1802,7 +1899,10 @@ async fn try_roll_signal(
     };
     let trade = ShadowTrade::new(setup.direction, setup.entry, setup.entry, setup.stop, Some(setup.target), 1, true);
     match db::insert_shadow_trade_v2(pool, session_date, symbol, r.cfg.slug, None, &trade).await {
-        Ok(id) => r.slot.open = Some(OpenTrade { db_id: id, trade, trust: 0.0, since: Utc::now() }),
+        Ok(id) => {
+            r.slot.open = Some(OpenTrade { db_id: id, trade, trust: 0.0, since: Utc::now() });
+            maybe_execute(pool, symbol, r.cfg.slug, id, &trade).await;
+        }
         Err(e) => {
             tracing::error!("{symbol}: insert_shadow_trade_v2 ({}) failed, setup not tracked: {e}", r.cfg.slug);
             return;

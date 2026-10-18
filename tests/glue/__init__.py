@@ -510,3 +510,16 @@ def every_configured_value_area_is_tracked():
 
 def the_retired_fades_are_not_active():
     _delegate('strategy::tests::deprecated_strategies_are_not_active', target=('-p', 'bilore-core', '--lib'))
+
+
+# --- MON-021 (order intents, 2026-10-18) ------------------------------------
+def execution_config_is_read_from_trading_rules():
+    _delegate('exec::tests::execution_config_is_read_from_trading_rules')
+
+
+def missing_execution_section_means_off():
+    _delegate('exec::tests::missing_execution_section_means_off')
+
+
+def checks_use_todays_realized_dollars_and_the_caps():
+    _delegate('exec::tests::checks_use_todays_realized_dollars_and_the_caps')

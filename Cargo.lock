@@ -208,6 +208,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "toml",
  "tpo-builder",
  "tracing",
  "tracing-subscriber",

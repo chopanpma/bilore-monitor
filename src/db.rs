@@ -307,6 +307,19 @@ pub async fn last_rth_volume_profile(
     })
 }
 
+/// MON-021: today's realized dollars per strategy from live_orders in one
+/// execution mode ("paper" / "live") — the SYS-001 / SYS-010 cap inputs.
+pub async fn realized_today(pool: &PgPool, mode: &str, day: NaiveDate) -> Result<Vec<(String, Decimal)>> {
+    Ok(sqlx::query_as(
+        "SELECT strategy, coalesce(sum(realized_usd), 0)::numeric FROM live_orders \
+         WHERE mode = $1 AND trading_date = $2 GROUP BY strategy",
+    )
+    .bind(mode)
+    .bind(day)
+    .fetch_all(pool)
+    .await?)
+}
+
 /// High and low of `symbol`'s recorded trades from `from` to `to` (Chicago
 /// wall clock) — MON-017's overnight range (prior RTH 15:00 -> 08:30).
 pub async fn price_range(
