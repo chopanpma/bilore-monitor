@@ -541,3 +541,24 @@ def va_alert_message_shows_the_trade_plan_and_profile():
 def the_old_single_mode_and_a_strategy_in_both_lists_are_refused():
     _delegate('exec::tests::the_old_single_mode_and_a_strategy_in_both_lists_are_refused')
 
+
+
+# --- MON-024 / MON-025 (2026-10-26) -----------------------------------------
+def fade_poc_globex_is_not_active():
+    _delegate('strategy::tests::deprecated_strategies_are_not_active', target=('-p', 'bilore-core', '--lib'))
+
+
+def the_alert_becomes_an_entered_trade_toward_the_poc():
+    _delegate('va_alert::tests::the_alert_becomes_an_entered_trade_toward_the_poc')
+
+
+def the_trust_measures_the_distance_to_the_poc_over_the_stop():
+    _delegate('va_alert::tests::the_trust_measures_the_distance_to_the_poc_over_the_stop')
+
+
+def a_trade_ends_with_its_session():
+    _delegate('va_alert::tests::a_trade_ends_with_its_session')
+
+
+def rows_are_dated_by_the_sessions_trading_date():
+    _delegate('va_alert::tests::rows_are_dated_by_the_sessions_trading_date')

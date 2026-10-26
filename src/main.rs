@@ -395,6 +395,11 @@ struct PerSymbolState {
     vol: VolGate,
     /// Manual-trading value-area alert (MON-011, 2026-10-07).
     va: VaState,
+    /// MON-025 fade-va-alert: the alert as a trade, its session (closed when
+    /// it ends) and that session's last price (the close mark).
+    va_fade: StrategySlot,
+    va_fade_session: Option<va_alert::SessionId>,
+    va_fade_mark: Option<Decimal>,
 }
 
 /// Everything MON-011 tracks for the current RTH or Globex session: the
@@ -712,6 +717,24 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
         }
         roll.push(RollSlot { cfg, slot, key });
     }
+    // MON-025 fade-va-alert: keep the newest open trade with the session it
+    // was opened in; the first live tick after that session closes it.
+    let mut va_fade = StrategySlot::default();
+    let mut va_fade_session = None;
+    for row in db::fetch_open_trades_for_strategy(pool, symbol, strategy::FADE_VA_ALERT).await? {
+        let Some(ot) = restore_open_trade(&row) else { continue };
+        if va_fade.open.is_none() {
+            va_fade_session = va_alert::session_of(ot.since.with_timezone(&Chicago).naive_local());
+            tracing::info!("{symbol}: restored open [{}] trade #{} ({:?})", strategy::FADE_VA_ALERT, ot.db_id, ot.trade.outcome);
+            va_fade.open = Some(ot);
+        } else {
+            let mut ot = ot;
+            if shadow_trader::close(&mut ot.trade) {
+                tracing::warn!("{symbol}: expiring extra open [{}] trade #{}", strategy::FADE_VA_ALERT, ot.db_id);
+                db::update_shadow_trade_v2(pool, ot.db_id, &ot.trade).await?;
+            }
+        }
+    }
     for (slug, s) in [(strategy::ML_MODEL, &ml), (strategy::FADE_POC, &fade), (strategy::FADE_POC_FILL, &fade_fill), (strategy::FADE_POC_WIDE, &wide), (strategy::FADE_PRIORPOC_2R, &priorpoc)] {
         if let Some(ot) = &s.open {
             tracing::info!("{symbol}: restored open [{slug}] trade #{} ({:?})", ot.db_id, ot.trade.outcome);
@@ -745,6 +768,9 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
         roll,
         vol: VolGate::new(load_vol_baseline(pool, symbol, today_ct).await, None),
         va: VaState::default(),
+        va_fade,
+        va_fade_session,
+        va_fade_mark: None,
         wide,
         priorpoc,
         priorpoc_prior: fetch_prior_rth_pct(pool, symbol, today_ct, priorpoc::VA_PCT).await?,
@@ -1135,6 +1161,25 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                // MON-025 fade-va-alert: the session's last price is the close
+                // mark; the first live tick after the session closes the trade.
+                if let Some(sess) = state.va_fade_session {
+                    if !va_alert::session_over(sess, tick_ct) {
+                        state.va_fade_mark = Some(tick.price);
+                    } else if may_signal(tick.ts, state.live_from) {
+                        let mark = state.va_fade_mark.unwrap_or(tick.price);
+                        if let Some(mut ot) = state.va_fade.open.take() {
+                            if shadow_trader::close_at_mark(&mut ot.trade, mark, state.tick_size, state.tick_value) {
+                                let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
+                                tracing::info!("{symbol}: [{}] #{} closed at the session end ({mark})", strategy::FADE_VA_ALERT, ot.db_id);
+                            }
+                        }
+                        state.va_fade = StrategySlot::default();
+                        state.va_fade_session = None;
+                        state.va_fade_mark = None;
+                    }
+                }
+
                 // MON-011 value-area alert: every tick builds the session's
                 // profile, 5-min bars and delta (the startup replay warms
                 // them up); alerts go out on live ticks only.
@@ -1178,6 +1223,12 @@ async fn main() -> Result<()> {
                                 tracing::info!("{symbol}: value-area alert {:?} fade {:?} at {}, other timeframe {:?}, {}/3 aligned", alert.side, alert.fade, alert.price, alert.otf, alert.agreeing());
                                 notify(&http, &bot_token, &chat_id, &msg).await;
                                 sound::play(sound::AlertKind::ValueArea);
+                                // MON-025: the same alert as a shadow trade.
+                                if strategy::is_active(strategy::FADE_VA_ALERT)
+                                    && gate_allows(&mut state.va_fade, &state.vol, tick_ct, symbol, strategy::FADE_VA_ALERT)
+                                {
+                                    try_va_fade_signal(&pool, symbol, &alert, state).await;
+                                }
                             }
                         }
                     }
@@ -1222,7 +1273,9 @@ async fn main() -> Result<()> {
                                 report_invalidated(&pool, symbol, strategy::FADE_POC_GLOBEX, &ot, &why).await;
                             }
                         }
-                        if state.globex.last_checked_price != Some(tick.price)
+                        // MON-024: retired 2026-10-26 — an open trade still resolves.
+                        if strategy::is_active(strategy::FADE_POC_GLOBEX)
+                            && state.globex.last_checked_price != Some(tick.price)
                             && gate_allows(&mut state.globex, &state.vol, tick_ct, symbol, strategy::FADE_POC_GLOBEX)
                         {
                             state.globex.last_checked_price = Some(tick.price);
@@ -1358,6 +1411,7 @@ async fn main() -> Result<()> {
                     (&mut state.globex, strategy::FADE_POC_GLOBEX),
                     (&mut state.wide, strategy::FADE_POC_WIDE),
                     (&mut state.priorpoc, strategy::FADE_PRIORPOC_2R),
+                    (&mut state.va_fade, strategy::FADE_VA_ALERT),
                 ];
                 let roll_slots = state.roll.iter_mut().map(|r| (&mut r.slot, r.cfg.slug));
                 let pf_slots = state.pf.iter_mut().map(|p| (&mut p.slot, p.cfg.slug));
@@ -1748,6 +1802,30 @@ async fn maybe_execute(pool: &PgPool, symbol: &str, slug: &str, trade_id: i64, t
             Err(e) => tracing::error!("{symbol}: [{slug}] #{trade_id} intent not acknowledged: {e}"),
         },
         Err(e) => tracing::error!("{symbol}: [{slug}] #{trade_id} intent publish failed: {e}"),
+    }
+}
+
+/// MON-025: record the value-area alert as a `fade-va-alert` trade, entered
+/// at the alert price (`va_alert::Alert::shadow_trade`), dated by its
+/// session's trading date.
+async fn try_va_fade_signal(pool: &PgPool, symbol: &str, alert: &va_alert::Alert, state: &mut PerSymbolState) {
+    let trade = alert.shadow_trade(state.tick_size, state.tick_value);
+    let trust = alert.trust();
+    let date = va_alert::trading_date(&alert.session);
+    match db::insert_shadow_trade_v2(pool, date, symbol, strategy::FADE_VA_ALERT, Some(trust), &trade).await {
+        Ok(id) => {
+            // Entered at once: write the entry price and time.
+            let _ = db::update_shadow_trade_v2(pool, id, &trade).await;
+            state.va_fade.open = Some(OpenTrade { db_id: id, trade, trust, since: Utc::now() });
+            state.va_fade_session = Some(alert.session);
+            state.va_fade_mark = Some(alert.price);
+            maybe_execute(pool, symbol, strategy::FADE_VA_ALERT, id, &trade).await;
+            tracing::info!(
+                "{symbol} LOCKED [{}]: {:?} entry={} stop={} (8 pt) target={} (POC) trust {:.0}%",
+                strategy::FADE_VA_ALERT, trade.direction, alert.price, trade.stop, alert.poc, trust * 100.0
+            );
+        }
+        Err(e) => tracing::error!("{symbol}: insert_shadow_trade_v2 ({}) failed, setup not tracked: {e}", strategy::FADE_VA_ALERT),
     }
 }
 

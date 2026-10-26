@@ -628,3 +628,47 @@ sequenceDiagram
 | --- | --- | --- | --- |
 | the_old_single_mode_and_a_strategy_in_both_lists_are_refused | MON-023-R1 | unit | Given [execution] mode = paper with strategies; then fade-roll-overnight in both paper and live, when exec::read_config runs, then an error naming SYS-014; then an error saying both paper and live. |
 
+## MON-024 — fade-poc-globex leaves shadow: it loses in shadow and its backtest lost in the first half of the year
+
+**Status:** accepted
+
+**Context:** User decision 2026-10-26. Shadow (bilore-backtest-gate 2026-10-26): 13 resolved, 4 won, 9 lost, 30.7%, -4.61 ticks/trade, -$75. Registered 2026-09-30 as a forward test whose backtest edge (+3.9..5.1 ticks/trade on 1-min bars) lost money in the first half of the year. It is removed from strategy::ACTIVE (bilore-core CORE-008), its arming now checks strategy::is_active (before, only the daily summary and the gate read ACTIVE), and it leaves the paper list. Rows are kept; an open trade still resolves.
+
+**Consequences:** + Globex shadow results concentrate on the rolling fades and fade-va-alert. - 13 trades is a small sample; if it was bad luck, a possibly-good rule loses its forward test.
+
+### Requirements
+
+| ID | Requirement |
+| --- | --- |
+| MON-024-R1 | WHEN fade-poc-globex would arm THEN it SHALL not, because strategy::is_active is false for it |
+
+### Scenarios
+
+| ID | Requirement | Layer | Scenario |
+| --- | --- | --- | --- |
+| fade_poc_globex_is_not_active | MON-024-R1 | unit | Given the deprecated slugs, including fade-poc-globex (2026-10-26), when strategy::is_active runs for each, then false. |
+
+## MON-025 — fade-va-alert: the value-area alert as a shadow trade — enter at the alert price toward the developing POC, 8-point stop, one open trade at a time, closed at the session end, RTH and Globex
+
+**Status:** accepted
+
+**Context:** User decision 2026-10-26 ('build the new strategy'), from the MON-011/MON-022 study (bilore-ml-rs findings 2026-10-26-va-alert-factors; bin/backtest_va_alert replays the live code). Whenever the MON-022 alert is sent (same evaluate and throttle) and the slot is free and the volatility block (SYS-006) allows, the monitor records a trade: entered at once at the alert price (va_alert::Alert::shadow_trade), target = the POC at alert time, stop = Alert::stop (8 points beyond the entry), 1 MES, trust 0.5 + 0.5 x clamp01(|entry - POC| / 8). No re-take rule and no flip invalidation (the replay had none). When the trade's session ends (va_alert::session_over: 15:00 for RTH, 08:30 for Globex) it is closed at the last in-session price. Rows are stored under the session's trading date (va_alert::trading_date: RTH its own date, Globex the next day). Evidence, one trade at a time, 2 ticks cost, 49 RTH + 8 Globex complete sessions: 159 trades, 60% win, +0.98 pt/trade, +$776, max drawdown -$480, H1 +$472 / H2 +$304; RTH 125 trades +$294 (H2 -$179); Globex 34 trades +$482 in 7 sessions. It is not in [execution] (shadow only).
+
+**Consequences:** + the alert's RTH and Globex value is measured automatically, trade by trade, in the daily summary and the go-live gate. - chosen after looking at the data: a forward test. - the replay ignored the volatility block; live skips trades during one.
+
+### Requirements
+
+| ID | Requirement |
+| --- | --- |
+| MON-025-R1 | WHEN the value-area alert is sent and the fade-va-alert slot is free THEN a trade SHALL be recorded entered at the alert price in the fade direction, with the POC as target, the stop 8 points beyond the entry, 1 contract and trust 0.5 + 0.5 x clamp01(\|entry - POC\| / 8) |
+| MON-025-R2 | WHEN a fade-va-alert trade's session ends THEN it SHALL be closed at the last in-session price, and its row SHALL be dated by the session's trading date |
+
+### Scenarios
+
+| ID | Requirement | Layer | Scenario |
+| --- | --- | --- | --- |
+| the_alert_becomes_an_entered_trade_toward_the_poc | MON-025-R1 | unit | Given a short alert at 5009.00 with POC 5005.00, and a long alert at 5002.00, when Alert::shadow_trade runs, then Short entered at 5009.00, stop 5017.00, target 5005.00, 1 contract; Long entered at 5002.00, stop 4994.00, target 5005.00. |
+| the_trust_measures_the_distance_to_the_poc_over_the_stop | MON-025-R1 | unit | Given alerts 4 points and 12 points from the POC, when Alert::trust runs, then 0.75 and 1.0. |
+| a_trade_ends_with_its_session | MON-025-R2 | unit | Given an RTH session and a Globex session, when session_over runs at 14:59 and 15:00, and at 08:29 and 08:30 the next morning, then false, true, false, true. |
+| rows_are_dated_by_the_sessions_trading_date | MON-025-R2 | unit | Given Monday's RTH session, Sunday 17:00's and Thursday 17:00's Globex sessions, when trading_date runs, then Monday, Monday, Friday. |
+

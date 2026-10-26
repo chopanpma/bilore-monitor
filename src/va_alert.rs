@@ -89,6 +89,22 @@ pub fn session_of(at: NaiveDateTime) -> Option<SessionId> {
     None
 }
 
+/// MON-025: a trade opened in `session` is over once `at` is outside it
+/// (RTH at 15:00, Globex at 08:30).
+pub fn session_over(session: SessionId, at: NaiveDateTime) -> bool {
+    session_of(at) != Some(session)
+}
+
+/// MON-025: the date a session's rows are stored under — RTH its own date,
+/// Globex the next day (sessions open Sunday-Thursday at 17:00 and trade for
+/// Monday-Friday), as the other Globex strategies store theirs.
+pub fn trading_date(session: &SessionId) -> chrono::NaiveDate {
+    match session.kind {
+        SessionKind::Rth => session.start.date(),
+        SessionKind::Globex => session.start.date() + Duration::days(1),
+    }
+}
+
 /// Index of the profile period `at` falls in: 30-minute periods in RTH
 /// (A = 0), 60-minute periods in Globex. Also the number of completed periods.
 pub fn period_of(session: &SessionId, at: NaiveDateTime) -> u32 {
@@ -235,6 +251,20 @@ impl Alert {
             Direction::Short => self.price + Decimal::from(STOP_POINTS),
             Direction::Long => self.price - Decimal::from(STOP_POINTS),
         }
+    }
+
+    /// MON-025 (`fade-va-alert`): the alert as a trade, entered at once at
+    /// the alert price toward the POC, `stop()` as the stop, 1 contract.
+    pub fn shadow_trade(&self, tick_size: Decimal, tick_value: Decimal) -> bilore_core::shadow_trader::ShadowTrade {
+        let mut trade = bilore_core::shadow_trader::ShadowTrade::new(self.fade, self.price, self.price, self.stop(), Some(self.poc), 1, true);
+        bilore_core::shadow_trader::on_price(&mut trade, self.price, tick_size, tick_value);
+        trade
+    }
+
+    /// MON-025 entry trust: 0.5 + 0.5 × clamp01(|entry − POC| / stop distance).
+    pub fn trust(&self) -> f64 {
+        let reach = ((self.price - self.poc).abs() / Decimal::from(STOP_POINTS)).to_f64().unwrap_or(0.0);
+        0.5 + 0.5 * reach.clamp(0.0, 1.0)
     }
 
     /// How many of structure, order flow and other timeframe agree.
@@ -609,6 +639,46 @@ mod tests {
         assert_eq!(a.stop(), d("5017.00"), "short: entry + 8");
         let long = evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5002.00"), &factors(None, 0, None), tick()).expect("alert");
         assert_eq!(long.stop(), d("4994.00"), "long: entry - 8");
+    }
+
+    // ── fade-va-alert, the alert as a trade (MON-025) ───────────────────────
+
+    #[test]
+    fn the_alert_becomes_an_entered_trade_toward_the_poc() {
+        use bilore_core::shadow_trader::Outcome;
+        let short = evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5009.00"), &factors(None, 0, None), tick()).expect("alert");
+        let t = short.shadow_trade(tick(), d("1.25"));
+        assert_eq!((t.direction, t.outcome, t.entry_price), (Direction::Short, Outcome::Entered, Some(d("5009.00"))));
+        assert_eq!((t.stop, t.target_1, t.mes_contracts), (d("5017.00"), Some(d("5005.00")), 1));
+        let long = evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5002.00"), &factors(None, 0, None), tick()).expect("alert");
+        let t = long.shadow_trade(tick(), d("1.25"));
+        assert_eq!((t.direction, t.entry_price, t.stop, t.target_1), (Direction::Long, Some(d("5002.00")), d("4994.00"), Some(d("5005.00"))));
+    }
+
+    #[test]
+    fn the_trust_measures_the_distance_to_the_poc_over_the_stop() {
+        let near = evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5009.00"), &factors(None, 0, None), tick()).expect("alert");
+        assert_eq!(near.trust(), 0.75, "4 of 8 points");
+        let far = evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5017.00"), &factors(None, 0, None), tick()).expect("alert");
+        assert_eq!(far.trust(), 1.0, "12 points: capped");
+    }
+
+    #[test]
+    fn a_trade_ends_with_its_session() {
+        let rth = session_of(ct(5, 10, 0)).unwrap();
+        assert!(!session_over(rth, ct(5, 14, 59)));
+        assert!(session_over(rth, ct(5, 15, 0)));
+        let globex = session_of(ct(5, 20, 0)).unwrap();
+        assert!(!session_over(globex, ct(6, 8, 29)));
+        assert!(session_over(globex, ct(6, 8, 30)));
+    }
+
+    #[test]
+    fn rows_are_dated_by_the_sessions_trading_date() {
+        let day = |n: u32| NaiveDate::from_ymd_opt(2026, 10, n).unwrap();
+        assert_eq!(trading_date(&session_of(ct(5, 10, 0)).unwrap()), day(5), "Monday RTH");
+        assert_eq!(trading_date(&session_of(ct(4, 18, 0)).unwrap()), day(5), "Sunday 17:00 Globex trades for Monday");
+        assert_eq!(trading_date(&session_of(ct(8, 18, 0)).unwrap()), day(9), "Thursday 17:00 Globex trades for Friday");
     }
 
     #[test]

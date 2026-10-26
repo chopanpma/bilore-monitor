@@ -58,6 +58,8 @@ RTH sessions, about 35% of hourly snapshots read double and 15% elongated. A rep
 | `candidate()` | Every condition except the 2-of-3 count, with each factor's read (used by `bin/backtest_va_alert`) | `a_candidate_carries_every_read_even_below_two_of_three` |
 | `evaluate()` | Every condition except the throttle: `candidate` with the other timeframe not against (MON-022) | `too_early_in_the_session_is_not_classified`, `price_above_vah_fades_short`, `price_below_val_fades_long`, `price_inside_the_value_area_never_alerts`, `an_irregular_profile_never_alerts`, `structure_and_order_flow_no_longer_decide`, `the_other_timeframe_against_vetoes_the_alert` |
 | `Alert::stop()` | Suggested stop, 8 points beyond the entry (MON-022) | `the_alert_carries_an_8_point_stop_beyond_the_entry` |
+| `Alert::shadow_trade()` / `Alert::trust()` | MON-025 `fade-va-alert`: the alert as a trade entered at its price, target POC, 8-pt stop, 1 MES; trust 0.5 + 0.5 × clamp01(\|entry − POC\| / 8) | `the_alert_becomes_an_entered_trade_toward_the_poc`, `the_trust_measures_the_distance_to_the_poc_over_the_stop` |
+| `session_over()` / `trading_date()` | MON-025: a trade ends with its session (15:00 / 08:30); rows dated RTH = own date, Globex = next day | `a_trade_ends_with_its_session`, `rows_are_dated_by_the_sessions_trading_date` |
 | `Tape` / `TapeContext` | Last 30 minutes' range (quiet < 10 pt) and the session's large prints (50+) by side, for the message's info lines; restarts each session | `the_tape_reads_the_30_minute_range_and_net_large_prints`, `the_tape_restarts_with_the_session` |
 | `AlertThrottle` | One per period unless the POC was crossed | `one_alert_per_period`, `a_poc_cross_re_arms_within_the_period`, `a_new_period_re_arms` |
 | `render_profile()` | Text profile, ≤ 24 rows of round size, VAH/POC/VAL and ◀ price | `the_text_profile_marks_vah_poc_val_and_price`, `the_text_profile_fits_in_24_rows` |
@@ -73,3 +75,18 @@ RTH sessions, about 35% of hourly snapshots read double and 15% elongated. A rep
 - MON-022 lets about 5 setups per session through instead of ~1.3 (study, 2026-10-26); the
   throttle is unchanged. RTH evidence is weak (recent half negative): re-run
   `cargo run --release --bin backtest_va_alert` and `scripts/va_alert_study.py` as sessions accumulate.
+
+## fade-va-alert (MON-025, 2026-10-26)
+
+The alert as a shadow strategy, so its RTH and Globex value is measured trade by trade. Wired in
+`main.rs`: when the alert is sent (same `evaluate` + throttle), `strategy::is_active` and
+`gate_allows` (armed slot, SYS-006 volatility block) pass, `try_va_fade_signal` inserts the
+`Alert::shadow_trade` (entered at once, entry written by an immediate update), stores the slot's
+session, and calls `maybe_execute` (not in `[execution]`: shadow only). The trade advances in the
+fixed-slot loop (target/stop, Telegram result). Each tick inside its session updates the close
+mark; the first live tick after the session ends closes it at that mark (`close_at_mark`). Restart:
+the newest open row is restored with the session of its `signal_at`; any older open rows expire.
+
+Deviations from the replay evidence: the volatility block (the replay had none); one trade at a time
+is the same rule the evidence was scored with.
+
