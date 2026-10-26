@@ -1272,3 +1272,51 @@ spec MON-025 {
     # delegates: va_alert::tests::rows_are_dated_by_the_sessions_trading_date
   }
 }
+
+decision MON-026 "The daily summary compares every executed order with its shadow trade, per strategy and mode, and flags a divergence" {
+  status: accepted
+  context: "User request 2026-10-26: keep the shadow record (it judges the rule; paper/live measure execution) and add a daily shadow vs paper line to know when they diverge significantly. Each live_orders row pairs with its shadow trade through trade_id. A pair compares when both finished: same outcome when the exits agree (target/won, stop/lost, close/expired); a missed fill when the shadow trade traded and the order was cancelled unfilled; an extra fill when the order filled and the shadow trade never entered; open pairs and pairs where neither traded are left out. Per strategy and mode the section shows today's pairs and the running total: counts, real $ vs shadow $ and the gap. Divergence (running total): at least 5 compared trades and either an average gap of at least $2.50/trade (2 MES ticks) with |t| >= 2, or more than 20% disagreeing (other outcome, missed or extra fill). Measured on the 2026-10-21..23 paper record: 7 pairs, same outcomes, +$3.39/trade, t about 1.6: not a divergence."
+  consequences: "+ execution cost per strategy is visible every day, and a drift is flagged. - realized_usd has no commissions (~$1.24/round trip on MES), so real reads slightly better than it is. - the thresholds are first-pass."
+}
+
+spec MON-026 {
+  requirement MON-026-R1 (EARS) {
+    text: "WHEN an executed order and its shadow trade have both finished THEN they SHALL compare as same or other outcome; an unfilled order whose shadow trade traded SHALL be a missed fill, a filled order whose shadow trade never entered an extra fill; open pairs and pairs where neither traded SHALL not compare"
+    layers: [unit]
+    scenarios: [each_order_is_compared_with_its_shadow_trade]
+  }
+  requirement MON-026-R2 (EARS) {
+    text: "WHEN at least 5 trades compare and the average gap is at least $2.50 per trade with |t| >= 2, or more than 20% disagree THEN the strategy SHALL be flagged diverged; with fewer it SHALL not"
+    layers: [unit]
+    scenarios: [small_or_few_gaps_are_not_a_divergence, a_consistent_gap_or_too_many_disagreements_is_a_divergence]
+  }
+  requirement MON-026-R3 (EARS) {
+    text: "WHEN the daily summary is sent and anything was ever executed THEN it SHALL end with a shadow vs paper/live section per strategy and mode: today's comparison when there is one, the running total and the verdict"
+    layers: [unit]
+    scenarios: [the_section_shows_today_the_total_and_the_verdict]
+  }
+  scenario each_order_is_compared_with_its_shadow_trade {
+    given: "orders closed at target/stop/close against won/lost/expired shadow trades, a cancelled order against a won one, a filled order against an invalidated one, and open pairs"
+    when: "exec_compare::compare runs"
+    then: "same, same, same, other outcome, missed fill, extra fill, nothing for neither-traded and open"
+    # delegates: exec_compare::tests::each_order_is_compared_with_its_shadow_trade
+  }
+  scenario small_or_few_gaps_are_not_a_divergence {
+    given: "the 7 paper pairs of 2026-10-21..23 (+$23.75), and 2 disagreeing pairs"
+    when: "Tally::diverged runs"
+    then: "not diverged either time"
+    # delegates: exec_compare::tests::small_or_few_gaps_are_not_a_divergence
+  }
+  scenario a_consistent_gap_or_too_many_disagreements_is_a_divergence {
+    given: "6 pairs each about $12 worse than shadow; 8 pairs with 2 missed fills"
+    when: "Tally::diverged runs"
+    then: "diverged both times"
+    # delegates: exec_compare::tests::a_consistent_gap_or_too_many_disagreements_is_a_divergence
+  }
+  scenario the_section_shows_today_the_total_and_the_verdict {
+    given: "three paper pairs of fade-priorpoc-va80-1.5r (one missed fill today) and one live fade-roll-overnight pair"
+    when: "exec_compare::section runs for 2026-10-23"
+    then: "per strategy and mode a Today line, a Total line with real vs shadow $ and the gap, 'ok so far'; nothing when no order exists"
+    # delegates: exec_compare::tests::the_section_shows_today_the_total_and_the_verdict
+  }
+}

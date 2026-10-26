@@ -562,3 +562,20 @@ def a_trade_ends_with_its_session():
 
 def rows_are_dated_by_the_sessions_trading_date():
     _delegate('va_alert::tests::rows_are_dated_by_the_sessions_trading_date')
+
+
+# --- MON-026 (shadow vs paper/live in the daily summary, 2026-10-26) --------
+def each_order_is_compared_with_its_shadow_trade():
+    _delegate('exec_compare::tests::each_order_is_compared_with_its_shadow_trade')
+
+
+def small_or_few_gaps_are_not_a_divergence():
+    _delegate('exec_compare::tests::small_or_few_gaps_are_not_a_divergence')
+
+
+def a_consistent_gap_or_too_many_disagreements_is_a_divergence():
+    _delegate('exec_compare::tests::a_consistent_gap_or_too_many_disagreements_is_a_divergence')
+
+
+def the_section_shows_today_the_total_and_the_verdict():
+    _delegate('exec_compare::tests::the_section_shows_today_the_total_and_the_verdict')

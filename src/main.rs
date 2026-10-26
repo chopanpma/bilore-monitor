@@ -1679,7 +1679,17 @@ async fn send_daily_summary(
         }
     };
     let gates = gate::compute_gates(&gate::group_by_strategy(&resolved), &STRATEGIES, &gate::TRUST_CFG);
-    let msg = daily_summary::summary_message(day, &roots.join("+"), &STRATEGIES, &week, &gates, &gate::TRUST_CFG);
+    let mut msg = daily_summary::summary_message(day, &roots.join("+"), &STRATEGIES, &week, &gates, &gate::TRUST_CFG);
+    // MON-026: shadow vs paper/live, when anything was executed. A read
+    // error drops only this section.
+    match db::fetch_exec_pairs(pool).await {
+        Ok(pairs) => {
+            if let Some(section) = bilore_monitor::exec_compare::section(&pairs, day) {
+                msg.push_str(&section);
+            }
+        }
+        Err(e) => tracing::warn!("daily summary for {day}: shadow vs paper/live section skipped — {e}"),
+    }
     notify(http, bot_token, chat_id, &msg).await;
 }
 

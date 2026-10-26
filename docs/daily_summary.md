@@ -53,3 +53,5 @@ Gate: 20+ trades, win ≥ 35%, exp ≥ 5.0t, P&L ≥ $100
   are marked `expired` at the midnight-CT rollover if nothing resolves
   them. `expired`/`invalidated` never count toward the gate line.
 - DB error → that day's summary is skipped and logged, never sent wrong.
+
+**Shadow vs paper/live (MON-026, 2026-10-26):** `send_daily_summary` appends `exec_compare::section` — per strategy and mode, today's and the running comparison of executed orders with their shadow trades, flagged ⚠️ DIVERGED by the rule in [exec_compare.md](exec_compare.md). Omitted when nothing was ever executed; a DB error drops only that section.

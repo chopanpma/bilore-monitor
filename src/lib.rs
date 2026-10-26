@@ -2,6 +2,7 @@ pub mod daily_summary;
 pub mod db;
 pub mod economics;
 pub mod exec;
+pub mod exec_compare;
 pub mod feed_watch;
 pub mod globex;
 pub mod levels;

@@ -309,6 +309,32 @@ pub async fn last_rth_volume_profile(
 
 /// MON-021: today's realized dollars per strategy from live_orders in one
 /// execution mode ("paper" / "live") — the SYS-001 / SYS-010 cap inputs.
+/// MON-026: every executed order with its shadow trade's outcome, for the
+/// summary's shadow vs paper/live section.
+pub async fn fetch_exec_pairs(pool: &PgPool) -> Result<Vec<crate::exec_compare::Pair>> {
+    type Row = (String, String, NaiveDate, String, Option<String>, Option<f64>, String, Option<f64>);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT l.mode, l.strategy, l.trading_date, l.status, l.exit_reason, l.realized_usd::float8, \
+                s.outcome, s.pnl_dollars::float8 \
+         FROM live_orders l JOIN shadow_trades_v2 s ON s.id = l.trade_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(mode, strategy, trading_date, status, exit_reason, realized_usd, shadow_outcome, shadow_usd)| crate::exec_compare::Pair {
+            mode,
+            strategy,
+            trading_date,
+            status,
+            exit_reason,
+            realized_usd,
+            shadow_outcome,
+            shadow_usd,
+        })
+        .collect())
+}
+
 pub async fn realized_today(pool: &PgPool, mode: &str, day: NaiveDate) -> Result<Vec<(String, Decimal)>> {
     Ok(sqlx::query_as(
         "SELECT strategy, coalesce(sum(realized_usd), 0)::numeric FROM live_orders \

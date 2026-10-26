@@ -672,3 +672,28 @@ sequenceDiagram
 | a_trade_ends_with_its_session | MON-025-R2 | unit | Given an RTH session and a Globex session, when session_over runs at 14:59 and 15:00, and at 08:29 and 08:30 the next morning, then false, true, false, true. |
 | rows_are_dated_by_the_sessions_trading_date | MON-025-R2 | unit | Given Monday's RTH session, Sunday 17:00's and Thursday 17:00's Globex sessions, when trading_date runs, then Monday, Monday, Friday. |
 
+## MON-026 — The daily summary compares every executed order with its shadow trade, per strategy and mode, and flags a divergence
+
+**Status:** accepted
+
+**Context:** User request 2026-10-26: keep the shadow record (it judges the rule; paper/live measure execution) and add a daily shadow vs paper line to know when they diverge significantly. Each live_orders row pairs with its shadow trade through trade_id. A pair compares when both finished: same outcome when the exits agree (target/won, stop/lost, close/expired); a missed fill when the shadow trade traded and the order was cancelled unfilled; an extra fill when the order filled and the shadow trade never entered; open pairs and pairs where neither traded are left out. Per strategy and mode the section shows today's pairs and the running total: counts, real $ vs shadow $ and the gap. Divergence (running total): at least 5 compared trades and either an average gap of at least $2.50/trade (2 MES ticks) with |t| >= 2, or more than 20% disagreeing (other outcome, missed or extra fill). Measured on the 2026-10-21..23 paper record: 7 pairs, same outcomes, +$3.39/trade, t about 1.6: not a divergence.
+
+**Consequences:** + execution cost per strategy is visible every day, and a drift is flagged. - realized_usd has no commissions (~$1.24/round trip on MES), so real reads slightly better than it is. - the thresholds are first-pass.
+
+### Requirements
+
+| ID | Requirement |
+| --- | --- |
+| MON-026-R1 | WHEN an executed order and its shadow trade have both finished THEN they SHALL compare as same or other outcome; an unfilled order whose shadow trade traded SHALL be a missed fill, a filled order whose shadow trade never entered an extra fill; open pairs and pairs where neither traded SHALL not compare |
+| MON-026-R2 | WHEN at least 5 trades compare and the average gap is at least $2.50 per trade with \|t\| >= 2, or more than 20% disagree THEN the strategy SHALL be flagged diverged; with fewer it SHALL not |
+| MON-026-R3 | WHEN the daily summary is sent and anything was ever executed THEN it SHALL end with a shadow vs paper/live section per strategy and mode: today's comparison when there is one, the running total and the verdict |
+
+### Scenarios
+
+| ID | Requirement | Layer | Scenario |
+| --- | --- | --- | --- |
+| each_order_is_compared_with_its_shadow_trade | MON-026-R1 | unit | Given orders closed at target/stop/close against won/lost/expired shadow trades, a cancelled order against a won one, a filled order against an invalidated one, and open pairs, when exec_compare::compare runs, then same, same, same, other outcome, missed fill, extra fill, nothing for neither-traded and open. |
+| small_or_few_gaps_are_not_a_divergence | MON-026-R2 | unit | Given the 7 paper pairs of 2026-10-21..23 (+$23.75), and 2 disagreeing pairs, when Tally::diverged runs, then not diverged either time. |
+| a_consistent_gap_or_too_many_disagreements_is_a_divergence | MON-026-R2 | unit | Given 6 pairs each about $12 worse than shadow; 8 pairs with 2 missed fills, when Tally::diverged runs, then diverged both times. |
+| the_section_shows_today_the_total_and_the_verdict | MON-026-R3 | unit | Given three paper pairs of fade-priorpoc-va80-1.5r (one missed fill today) and one live fade-roll-overnight pair, when exec_compare::section runs for 2026-10-23, then per strategy and mode a Today line, a Total line with real vs shadow $ and the gap, 'ok so far'; nothing when no order exists. |
+
