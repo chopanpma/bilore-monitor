@@ -132,9 +132,11 @@ pub fn volatility_over_message(symbol: &str, block: &Block) -> String {
     )
 }
 
-/// MON-011: the manual-trading value-area alert, with each factor's read
-/// and a text profile (`va_alert::render_profile`) in a monospace block.
-pub fn va_alert_message(symbol: &str, alert: &crate::va_alert::Alert, profile_text: &str) -> String {
+/// MON-011 / MON-022: the manual-trading value-area alert: the fade, its
+/// target (the POC) and suggested stop, the other timeframe's read, the
+/// tape's info lines and a text profile (`va_alert::render_profile`) in a
+/// monospace block.
+pub fn va_alert_message(symbol: &str, alert: &crate::va_alert::Alert, tape: &crate::va_alert::TapeContext, profile_text: &str) -> String {
     use crate::va_alert::{Read, SessionKind, Shape, Side};
     let (where_, level) = match alert.side {
         Side::Upper => ("above VAH", alert.vah),
@@ -151,28 +153,37 @@ pub fn va_alert_message(symbol: &str, alert: &crate::va_alert::Alert, profile_te
         SessionKind::Globex => "Globex",
     };
     let period = (b'A' + alert.period.min(25) as u8) as char;
-    let read = |r: Read| match r {
+    let otf = match alert.otf {
         Read::Agree => "✅ agrees",
         Read::Disagree => "❌ against",
         Read::Neutral => "➖ neutral",
     };
+    let activity = if tape.quiet() {
+        format!("Quiet: 30-min range {:.2} pt — fades reached the POC more often (60% vs 47%)", tape.range30)
+    } else {
+        format!("Active: 30-min range {:.2} pt", tape.range30)
+    };
+    let large = match tape.large_net_with(alert.fade) {
+        0 => "Large prints even".to_string(),
+        n if n > 0 => format!("Large prints {n:+} with the fade"),
+        n => format!("Large prints {n:+} against the fade"),
+    };
     format!(
         "📊 <b>[V2] VALUE AREA — {symbol}</b>\n\
          Price <b>{:.2}</b> {where_} {:.2} → <b>fade {}</b>\n\
-         Shape: {shape} · {session} period {period} · <b>{}/3 aligned</b>\n\
-         Structure       {}\n\
-         Order flow      {} (Δ {})\n\
-         Other timeframe {}\n\
+         Shape: {shape} · {session} period {period}\n\
+         Target POC {:.2} ({:.2} pt) · Stop {:.2} (8 pt)\n\
+         Other timeframe {otf}\n\
+         {activity}\n\
+         {large}\n\
          VAH {:.2} · POC {:.2} · VAL {:.2}\n\
          <pre>{profile_text}</pre>",
         alert.price,
         level,
         direction_str(alert.fade),
-        alert.agreeing(),
-        read(alert.structure),
-        read(alert.order_flow),
-        alert.delta,
-        read(alert.otf),
+        alert.poc,
+        (alert.price - alert.poc).abs(),
+        alert.stop(),
         alert.vah,
         alert.poc,
         alert.val,
@@ -320,8 +331,8 @@ mod tests {
     }
 
     #[test]
-    fn va_alert_message_shows_alignment_and_profile() {
-        use crate::va_alert::{Alert, Read, SessionId, SessionKind, Shape, Side};
+    fn va_alert_message_shows_the_trade_plan_and_profile() {
+        use crate::va_alert::{Alert, Read, SessionId, SessionKind, Shape, Side, TapeContext};
         let d = |s: &str| s.parse::<Decimal>().unwrap();
         let alert = Alert {
             session: SessionId { kind: SessionKind::Rth, start: ct(8, 30) },
@@ -338,10 +349,21 @@ mod tests {
             vah: d("5007.00"),
             val: d("5004.00"),
         };
-        let msg = va_alert_message("MESZ6", &alert, "5010.00 ██ \n5009.00 ███ ◀ 5009.25");
-        for want in ["[V2] VALUE AREA — MESZ6", "above VAH", "fade SHORT", "Shape: P", "2/3 aligned", "Structure", "Order flow", "Δ -812", "Other timeframe", "RTH", "<pre>", "5009.00 ███ ◀ 5009.25"] {
+        let tape = TapeContext { range30: d("7.50"), large_buy: 1, large_sell: 3 };
+        let msg = va_alert_message("MESZ6", &alert, &tape, "5010.00 ██ \n5009.00 ███ ◀ 5009.25");
+        for want in [
+            "[V2] VALUE AREA — MESZ6", "above VAH", "fade SHORT", "Shape: P", "RTH", "Other timeframe", "❌ against",
+            "Target POC 5005.00 (4.25 pt)", "Stop 5017.25 (8 pt)", "Quiet: 30-min range 7.50 pt", "Large prints +2 with the fade",
+            "<pre>", "5009.00 ███ ◀ 5009.25",
+        ] {
             assert!(msg.contains(want), "missing {want:?} in\n{msg}");
         }
+        for gone in ["aligned", "Structure", "Order flow"] {
+            assert!(!msg.contains(gone), "{gone:?} should be gone (MON-022) in\n{msg}");
+        }
+        let busy = TapeContext { range30: d("14.00"), large_buy: 2, large_sell: 0 };
+        let msg = va_alert_message("MESZ6", &alert, &busy, "");
+        assert!(msg.contains("Active: 30-min range 14.00 pt") && msg.contains("Large prints -2 against the fade"), "{msg}");
     }
 
     #[test]

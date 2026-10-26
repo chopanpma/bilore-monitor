@@ -26,7 +26,7 @@ flowchart LR
 | `result_message()` | Won/Lost/Expired icon + entry/exit + entry trust (`Trust: NN%` — the 0..1 score captured at lock time, same value persisted to `shadow_trades_v2.confidence`; semantics per strategy, contracts/strategies.md "Trust metric") + PnL | `result_message_shows_won_outcome_and_pnl`, `result_message_shows_lost_outcome` |
 | `volatility_started_message()` | ⚠️ `[V2] VOLATILITY` — no new setups: reason (release name / RTH open / Globex reopen / spike Nx the normal 30-second move) and until when (bilore-specs SYS-006, 2026-10-04) | `volatility_message_names_the_reason_and_when_it_ends` |
 | `volatility_over_message()` | ✅ `[V2] VOLATILITY OVER` — new setups allowed again, naming what ended | `volatility_over_message_says_setups_are_allowed_again` |
-| `va_alert_message()` | 📊 `[V2] VALUE AREA` — side, fade direction, shape, period, each factor's read (✅/❌/➖), VAH/POC/VAL and the text profile in `<pre>` (MON-011, 2026-10-07) | `va_alert_message_shows_alignment_and_profile` |
+| `va_alert_message()` | 📊 `[V2] VALUE AREA` — side, fade direction, shape, period, POC target and 8-pt stop, the other timeframe's read (✅/❌/➖), quiet/active 30-min range, net large prints, VAH/POC/VAL and the text profile in `<pre>` (MON-011 2026-10-07, MON-022 2026-10-26: no structure / order flow / alignment count) | `va_alert_message_shows_the_trade_plan_and_profile` |
 | `feed_down_message()` / `feed_back_message()` | ⚠️ `[V2] NO MARKET DATA` (since when, how long, what to check) and ✅ `[V2] MARKET DATA BACK` (MON-015, 2026-10-17) | `feed_messages_say_since_when_and_what_to_check` |
 | `send()` | POSTs to the Telegram Bot API, HTML parse mode (matches v1's convention) | not tested — network I/O |
 

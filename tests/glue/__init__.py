@@ -313,16 +313,8 @@ def an_irregular_profile_never_alerts():
     _delegate('va_alert::tests::an_irregular_profile_never_alerts')
 
 
-def two_of_three_agreeing_with_the_fade_alerts():
-    _delegate('va_alert::tests::two_of_three_agreeing_with_the_fade_alerts')
-
-
-def one_of_three_does_not_alert():
-    _delegate('va_alert::tests::one_of_three_does_not_alert')
-
-
-def neutral_factors_do_not_count():
-    _delegate('va_alert::tests::neutral_factors_do_not_count')
+def a_candidate_carries_every_read_even_below_two_of_three():
+    _delegate('va_alert::tests::a_candidate_carries_every_read_even_below_two_of_three')
 
 
 def one_alert_per_period():
@@ -343,10 +335,6 @@ def the_text_profile_marks_vah_poc_val_and_price():
 
 def the_text_profile_fits_in_24_rows():
     _delegate('va_alert::tests::the_text_profile_fits_in_24_rows')
-
-
-def va_alert_message_shows_alignment_and_profile():
-    _delegate('telegram::tests::va_alert_message_shows_alignment_and_profile')
 
 
 def result_message_shows_lost_outcome():
@@ -523,3 +511,33 @@ def missing_execution_section_means_off():
 
 def checks_use_todays_realized_dollars_and_the_caps():
     _delegate('exec::tests::checks_use_todays_realized_dollars_and_the_caps')
+
+
+def structure_and_order_flow_no_longer_decide():
+    _delegate('va_alert::tests::structure_and_order_flow_no_longer_decide')
+
+
+def the_other_timeframe_against_vetoes_the_alert():
+    _delegate('va_alert::tests::the_other_timeframe_against_vetoes_the_alert')
+
+
+def the_alert_carries_an_8_point_stop_beyond_the_entry():
+    _delegate('va_alert::tests::the_alert_carries_an_8_point_stop_beyond_the_entry')
+
+
+def the_tape_reads_the_30_minute_range_and_net_large_prints():
+    _delegate('va_alert::tests::the_tape_reads_the_30_minute_range_and_net_large_prints')
+
+
+def the_tape_restarts_with_the_session():
+    _delegate('va_alert::tests::the_tape_restarts_with_the_session')
+
+
+def va_alert_message_shows_the_trade_plan_and_profile():
+    _delegate('telegram::tests::va_alert_message_shows_the_trade_plan_and_profile')
+
+
+# --- MON-023 (per-strategy execution mode, 2026-10-26) ----------------------
+def the_old_single_mode_and_a_strategy_in_both_lists_are_refused():
+    _delegate('exec::tests::the_old_single_mode_and_a_strategy_in_both_lists_are_refused')
+

@@ -1,6 +1,7 @@
 # va_alert
 
-Source: `src/va_alert.rs` · New 2026-10-07, user request (MON-011). A manual-trading
+Source: `src/va_alert.rs` · New 2026-10-07, user request (MON-011); rule changed 2026-10-26
+(MON-022, [findings](../../bilore-ml-rs/docs/findings/2026-10-26-va-alert-factors.md)). A manual-trading
 prompt, not a shadow strategy: it places and records nothing, it only sends one Telegram
 message when the fade back into value looks supported.
 
@@ -18,16 +19,16 @@ flowchart TD
     Shape -- Irregular --> Skip2
     Shape -- "D / P / b" --> Side{"price > VAH or < VAL?"}
     Side -- inside --> Skip2
-    Side -- "above VAH: fade SHORT\nbelow VAL: fade LONG" --> Count{">= 2 of structure, order flow,\nother timeframe agree with the fade?"}
-    Count -- no --> Skip2
-    Count -- yes --> Thr{"AlertThrottle: first in this period,\nor POC crossed since the last?"}
+    Side -- "above VAH: fade SHORT\nbelow VAL: fade LONG" --> Count{"other timeframe against the fade?\n(MON-022; structure and order flow\nare recorded, not counted)"}
+    Count -- yes --> Skip2
+    Count -- "no (agrees, neutral or unavailable)" --> Thr{"AlertThrottle: first in this period,\nor POC crossed since the last?"}
     Thr -- no --> Skip2
-    Thr -- yes --> Send["telegram::va_alert_message + render_profile"]
+    Thr -- yes --> Send["telegram::va_alert_message:\nPOC target, 8-pt stop, other timeframe,\nTape (30-min range, large prints), profile"]
 ```
 
 ## Inputs (main.rs `VaState`)
 
-| Factor | Read | Agrees when |
+| Factor | Read | Agrees when (since MON-022 only the other timeframe decides: against = no alert) |
 |---|---|---|
 | Structure | `analyze_structure` over the session's 5-min bars, pivot_n 3 | bias direction = fade |
 | Order flow | session cumulative tick-rule delta | `order_flow_check(delta, fade)` confirms (\|Δ\| ≥ 500) |
@@ -54,7 +55,10 @@ RTH sessions, about 35% of hourly snapshots read double and 15% elongated. A rep
 | `session_of()` / `period_of()` | Session and profile period at a Chicago time | `session_of_maps_rth_globex_and_the_gap`, `periods_are_30_minutes_in_rth_and_60_in_globex` |
 | `DevelopingProfile::on_trade()` | Session profile, restarts each session | `the_profile_restarts_at_each_session_start` |
 | `classify_shape()` | D / P / b / Irregular | `a_bell_shaped_profile_is_d`, `a_profile_with_its_poc_in_the_upper_third_is_p`, `a_profile_with_its_poc_in_the_lower_third_is_b`, `a_double_distribution_is_irregular`, `a_thin_elongated_profile_is_irregular` |
-| `evaluate()` | All MON-011 conditions except the throttle | `too_early_in_the_session_is_not_classified`, `price_above_vah_fades_short`, `price_below_val_fades_long`, `price_inside_the_value_area_never_alerts`, `an_irregular_profile_never_alerts`, `two_of_three_agreeing_with_the_fade_alerts`, `one_of_three_does_not_alert`, `neutral_factors_do_not_count` |
+| `candidate()` | Every condition except the 2-of-3 count, with each factor's read (used by `bin/backtest_va_alert`) | `a_candidate_carries_every_read_even_below_two_of_three` |
+| `evaluate()` | Every condition except the throttle: `candidate` with the other timeframe not against (MON-022) | `too_early_in_the_session_is_not_classified`, `price_above_vah_fades_short`, `price_below_val_fades_long`, `price_inside_the_value_area_never_alerts`, `an_irregular_profile_never_alerts`, `structure_and_order_flow_no_longer_decide`, `the_other_timeframe_against_vetoes_the_alert` |
+| `Alert::stop()` | Suggested stop, 8 points beyond the entry (MON-022) | `the_alert_carries_an_8_point_stop_beyond_the_entry` |
+| `Tape` / `TapeContext` | Last 30 minutes' range (quiet < 10 pt) and the session's large prints (50+) by side, for the message's info lines; restarts each session | `the_tape_reads_the_30_minute_range_and_net_large_prints`, `the_tape_restarts_with_the_session` |
 | `AlertThrottle` | One per period unless the POC was crossed | `one_alert_per_period`, `a_poc_cross_re_arms_within_the_period`, `a_new_period_re_arms` |
 | `render_profile()` | Text profile, ≤ 24 rows of round size, VAH/POC/VAL and ◀ price | `the_text_profile_marks_vah_poc_val_and_price`, `the_text_profile_fits_in_24_rows` |
 
@@ -66,3 +70,6 @@ RTH sessions, about 35% of hourly snapshots read double and 15% elongated. A rep
 - Not silenced by the SYS-006 volatility block (it is information, not an entry); the
   message adds a line when a block is on.
 - Price one tick outside the value area already counts.
+- MON-022 lets about 5 setups per session through instead of ~1.3 (study, 2026-10-26); the
+  throttle is unchanged. RTH evidence is weak (recent half negative): re-run
+  `cargo run --release --bin backtest_va_alert` and `scripts/va_alert_study.py` as sessions accumulate.

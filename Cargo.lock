@@ -167,6 +167,7 @@ dependencies = [
  "quick-xml",
  "rust_decimal",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

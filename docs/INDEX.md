@@ -18,7 +18,8 @@ via `git config core.hooksPath .githooks`). `db.rs` (DB I/O) and `main.rs`
 | `levels.rs` | done (2026-10-02 — prior RTH levels from ticks) | [levels.md](levels.md) |
 | `rolling.rs` | done (2026-10-02 — `fade-roll-*`, user style with rolling levels) | [rolling.md](rolling.md) |
 | `vol_gate.rs` | done (2026-10-04 — volatility gate, bilore-specs SYS-006) | [vol_gate.md](vol_gate.md) |
-| `va_alert.rs` | done (2026-10-07 — value-area alert for manual trading, MON-011) | [va_alert.md](va_alert.md) |
+| `va_alert.rs` | done (2026-10-07 — value-area alert for manual trading, MON-011; rule MON-022 2026-10-26) | [va_alert.md](va_alert.md) |
+| `bin/backtest_va_alert.rs` | done (2026-10-26 — alert replay + cockpit-variable study) | [backtest_va_alert.md](backtest_va_alert.md) |
 | `wide.rs` | done (2026-10-12 — `fade-poc-wide`, MON-014) | [wide.md](wide.md) |
 | `priorpoc.rs` | done (2026-10-18 — `fade-priorpoc-2r`, MON-016) | [priorpoc.md](priorpoc.md) |
 | `profile_fade.rs` | done (2026-10-18 — five sweep fades, MON-017) | [profile_fade.md](profile_fade.md) |

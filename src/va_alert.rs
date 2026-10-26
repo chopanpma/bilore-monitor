@@ -39,6 +39,13 @@ const SMOOTH_POINTS: usize = 5;
 const ELONGATED_VA: f64 = 0.65;
 /// Bucket for the double-distribution check, in ticks (1 point).
 const SHAPE_BUCKET_TICKS: u32 = 4;
+/// MON-022: suggested stop beyond the entry, in points (beat 4 and 6 with the
+/// POC as target in the 2026-10-26 study).
+const STOP_POINTS: i64 = 8;
+/// Quiet market: 30-minute range under this many points (MON-022 info line).
+const QUIET_RANGE: i64 = 10;
+/// Large print, in contracts (the cockpit's `large_print_min`).
+const LARGE_PRINT_MIN: i64 = 50;
 /// Width of the longest volume bar in the text profile, in characters.
 const BAR_WIDTH: usize = 16;
 
@@ -222,15 +229,30 @@ pub struct Alert {
 }
 
 impl Alert {
+    /// MON-022: the suggested stop, `STOP_POINTS` beyond the entry price.
+    pub fn stop(&self) -> Decimal {
+        match self.fade {
+            Direction::Short => self.price + Decimal::from(STOP_POINTS),
+            Direction::Long => self.price - Decimal::from(STOP_POINTS),
+        }
+    }
+
     /// How many of structure, order flow and other timeframe agree.
     pub fn agreeing(&self) -> usize {
         [self.structure, self.order_flow, self.otf].iter().filter(|r| **r == Read::Agree).count()
     }
 }
 
-/// The alert for `price` at `at`, if every MON-011 condition holds
-/// (throttling is `AlertThrottle`'s job).
+/// The alert for `price` at `at`, if every condition holds (throttling is
+/// `AlertThrottle`'s job): a candidate whose other timeframe is not against
+/// the fade (MON-022; structure and order flow are recorded, not counted).
 pub fn evaluate(profile: &DevelopingProfile, at: NaiveDateTime, price: Decimal, factors: &Factors, tick: Decimal) -> Option<Alert> {
+    candidate(profile, at, price, factors, tick).filter(|a| a.otf != Read::Disagree)
+}
+
+/// Price outside a normally shaped profile's value area, with each factor's
+/// read and no factor filter (the alert backtest studies them all).
+pub fn candidate(profile: &DevelopingProfile, at: NaiveDateTime, price: Decimal, factors: &Factors, tick: Decimal) -> Option<Alert> {
     let session = profile.session.filter(|s| session_of(at) == Some(*s))?;
     let period = period_of(&session, at);
     if period < MIN_PERIODS {
@@ -256,7 +278,7 @@ pub fn evaluate(profile: &DevelopingProfile, at: NaiveDateTime, price: Decimal, 
         SignalCheck::Conflict => Read::Disagree,
         SignalCheck::Neutral => Read::Neutral,
     };
-    let alert = Alert {
+    Some(Alert {
         session,
         period,
         side,
@@ -270,8 +292,67 @@ pub fn evaluate(profile: &DevelopingProfile, at: NaiveDateTime, price: Decimal, 
         poc,
         vah,
         val,
-    };
-    (alert.agreeing() >= 2).then_some(alert)
+    })
+}
+
+/// MON-022 info lines: the last 30 minutes' range and the session's large
+/// prints by aggressor side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TapeContext {
+    pub range30: Decimal,
+    pub large_buy: usize,
+    pub large_sell: usize,
+}
+
+impl TapeContext {
+    /// Fades reached the POC more often in a quiet market (60% vs 47%).
+    pub fn quiet(&self) -> bool {
+        self.range30 < Decimal::from(QUIET_RANGE)
+    }
+
+    /// Net large prints on the fade's side: + = more with the fade.
+    pub fn large_net_with(&self, fade: Direction) -> i64 {
+        let (buy, sell) = (self.large_buy as i64, self.large_sell as i64);
+        match fade {
+            Direction::Long => buy - sell,
+            Direction::Short => sell - buy,
+        }
+    }
+}
+
+/// The session's tape for `TapeContext`; restarts with each session.
+#[derive(Debug, Clone, Default)]
+pub struct Tape {
+    session: Option<SessionId>,
+    recent: std::collections::VecDeque<(NaiveDateTime, Decimal)>,
+    large_buy: usize,
+    large_sell: usize,
+}
+
+impl Tape {
+    /// Add a classified trade; trades outside any session are ignored.
+    pub fn on_trade(&mut self, at: NaiveDateTime, price: Decimal, size: i64, side: bilore_core::order_flow::Side) {
+        let Some(session) = session_of(at) else { return };
+        if self.session != Some(session) {
+            *self = Self { session: Some(session), ..Self::default() };
+        }
+        self.recent.push_back((at, price));
+        while self.recent.front().is_some_and(|(t, _)| at - *t > Duration::minutes(30)) {
+            self.recent.pop_front();
+        }
+        if size >= LARGE_PRINT_MIN {
+            match side {
+                bilore_core::order_flow::Side::Buy => self.large_buy += 1,
+                bilore_core::order_flow::Side::Sell => self.large_sell += 1,
+            }
+        }
+    }
+
+    pub fn context(&self, now: NaiveDateTime) -> TapeContext {
+        let prices = self.recent.iter().filter(|(t, _)| now - *t <= Duration::minutes(30)).map(|(_, p)| *p);
+        let (lo, hi) = prices.fold((None::<Decimal>, None::<Decimal>), |(lo, hi), p| (Some(lo.map_or(p, |l| l.min(p))), Some(hi.map_or(p, |h| h.max(p)))));
+        TapeContext { range30: hi.zip(lo).map_or(Decimal::ZERO, |(h, l)| h - l), large_buy: self.large_buy, large_sell: self.large_sell }
+    }
 }
 
 /// One alert per profile period unless price crossed the POC since.
@@ -476,11 +557,11 @@ mod tests {
         assert!(evaluate(&p, ct(5, 9, 30), d("5009.00"), &all, tick()).is_some(), "A and B completed");
     }
 
-    // ── trigger, side and alignment ──────────────────────────────────────────
+    // ── trigger, side and the other-timeframe veto ──────────────────────────────────────────
 
     #[test]
     fn price_above_vah_fades_short() {
-        let a = evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5009.00"), &factors(Some(Direction::Short), -800, Some(Direction::Long)), tick())
+        let a = evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5009.00"), &factors(Some(Direction::Short), -800, None), tick())
             .expect("alert");
         assert_eq!((a.side, a.fade, a.shape), (Side::Upper, Direction::Short, Shape::D));
         assert_eq!((a.poc, a.vah, a.val), (d("5005.00"), d("5007.00"), d("5004.00")));
@@ -489,7 +570,7 @@ mod tests {
 
     #[test]
     fn price_below_val_fades_long() {
-        let a = evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5002.00"), &factors(Some(Direction::Long), 800, Some(Direction::Short)), tick())
+        let a = evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5002.00"), &factors(Some(Direction::Long), 800, None), tick())
             .expect("alert");
         assert_eq!((a.side, a.fade), (Side::Lower, Direction::Long));
     }
@@ -507,23 +588,64 @@ mod tests {
     }
 
     #[test]
-    fn two_of_three_agreeing_with_the_fade_alerts() {
-        let a = evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5009.00"), &factors(Some(Direction::Short), -800, Some(Direction::Long)), tick())
+    fn structure_and_order_flow_no_longer_decide() {
+        // both against the short fade, other timeframe neutral: still an alert (MON-022)
+        let a = evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5009.00"), &factors(Some(Direction::Long), 800, None), tick())
             .expect("alert");
-        assert_eq!((a.structure, a.order_flow, a.otf), (Read::Agree, Read::Agree, Read::Disagree));
-        assert_eq!(a.agreeing(), 2);
+        assert_eq!((a.structure, a.order_flow, a.otf), (Read::Disagree, Read::Disagree, Read::Neutral));
     }
 
     #[test]
-    fn one_of_three_does_not_alert() {
+    fn the_other_timeframe_against_vetoes_the_alert() {
+        let f = factors(Some(Direction::Short), -800, Some(Direction::Long));
+        assert_eq!(evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5009.00"), &f, tick()), None);
+        let agrees = factors(None, 0, Some(Direction::Short));
+        assert!(evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5009.00"), &agrees, tick()).is_some());
+    }
+
+    #[test]
+    fn the_alert_carries_an_8_point_stop_beyond_the_entry() {
+        let a = evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5009.00"), &factors(None, 0, None), tick()).expect("alert");
+        assert_eq!(a.stop(), d("5017.00"), "short: entry + 8");
+        let long = evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5002.00"), &factors(None, 0, None), tick()).expect("alert");
+        assert_eq!(long.stop(), d("4994.00"), "long: entry - 8");
+    }
+
+    #[test]
+    fn the_tape_reads_the_30_minute_range_and_net_large_prints() {
+        use bilore_core::order_flow::Side as Flow;
+        let mut tape = Tape::default();
+        tape.on_trade(ct(5, 9, 0), d("5020.00"), 60, Flow::Buy); // 70 minutes before: out of the range, still a large print
+        tape.on_trade(ct(5, 9, 45), d("5004.00"), 50, Flow::Sell);
+        tape.on_trade(ct(5, 9, 50), d("5001.00"), 3, Flow::Sell);
+        tape.on_trade(ct(5, 10, 10), d("5009.00"), 80, Flow::Buy);
+        let c = tape.context(ct(5, 10, 10));
+        assert_eq!(c.range30, d("8.00"), "5001-5009 since 09:40");
+        assert_eq!(c.large_buy, 2);
+        assert_eq!(c.large_sell, 1);
+        assert!(c.quiet());
+        assert_eq!(c.large_net_with(Direction::Short), -1, "2 large buys, 1 large sell: against a short");
+        tape.on_trade(ct(5, 10, 12), d("5012.00"), 1, Flow::Buy);
+        assert!(!tape.context(ct(5, 10, 12)).quiet(), "range 11 points");
+    }
+
+    #[test]
+    fn the_tape_restarts_with_the_session() {
+        use bilore_core::order_flow::Side as Flow;
+        let mut tape = Tape::default();
+        tape.on_trade(ct(5, 14, 50), d("5020.00"), 60, Flow::Buy);
+        tape.on_trade(ct(5, 17, 1), d("5000.00"), 1, Flow::Buy);
+        let c = tape.context(ct(5, 17, 1));
+        assert_eq!((c.range30, c.large_buy), (Decimal::ZERO, 0));
+    }
+
+    #[test]
+    fn a_candidate_carries_every_read_even_below_two_of_three() {
         let f = factors(Some(Direction::Short), 800, Some(Direction::Long));
-        assert_eq!(evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5009.00"), &f, tick()), None);
-    }
-
-    #[test]
-    fn neutral_factors_do_not_count() {
-        let f = factors(Some(Direction::Short), -300, None);
-        assert_eq!(evaluate(&rth_profile(&BELL), ct(5, 10, 0), d("5009.00"), &f, tick()), None);
+        let c = candidate(&rth_profile(&BELL), ct(5, 10, 0), d("5009.00"), &f, tick()).expect("candidate");
+        assert_eq!((c.fade, c.structure, c.order_flow, c.otf), (Direction::Short, Read::Agree, Read::Disagree, Read::Disagree));
+        assert_eq!(c.agreeing(), 1);
+        assert_eq!(candidate(&rth_profile(&BELL), ct(5, 10, 0), d("5005.00"), &f, tick()), None, "inside value: no candidate");
     }
 
     // ── throttle ─────────────────────────────────────────────────────────────

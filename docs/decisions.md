@@ -312,9 +312,9 @@ sequenceDiagram
 | MON-011-R1 | WHEN the monitor receives a live trade THEN it SHALL add it to the developing profile of its session, RTH 08:30-15:00 CT or Globex 17:00-08:30 CT, which restarts empty at each session start; trades between 15:00 and 17:00 CT belong to no session |
 | MON-011-R2 | WHEN the profile has at least 2 completed periods THEN it SHALL be classified D, P or b by its POC's third of the range, or Irregular when it has a double distribution or a value area wider than 65% of its range; before that it SHALL not be classified |
 | MON-011-R3 | WHEN price is above VAH or below VAL of a D, P or b profile THEN the fade direction SHALL be SHORT or LONG respectively; inside the value area or on an irregular profile there SHALL be no alert |
-| MON-011-R4 | WHEN at least 2 of structure, order flow and the other timeframe agree with the fade direction THEN the alert SHALL fire; a neutral or unavailable factor SHALL not count |
+| MON-011-R4 | WHEN price is outside the value area of a D, P or b profile THEN va_alert::candidate SHALL carry each factor's read (structure, order flow, other timeframe) and their agreeing count without filtering on them; which candidates alert is MON-022 |
 | MON-011-R5 | WHEN an alert was sent in the current profile period THEN no other SHALL be sent in that period unless price has crossed the POC since; a new period SHALL allow a new alert |
-| MON-011-R6 | WHEN the alert is sent THEN the message SHALL show the side, fade direction, shape, each factor's read, VAH/POC/VAL and a text profile of at most 24 rows marking VAH, POC, VAL and the price |
+| MON-011-R6 | WHEN the alert is sent THEN the message SHALL include a text profile of at most 24 rows marking VAH, POC, VAL and the price (the rest of the message is MON-022-R3) |
 
 ### Scenarios
 
@@ -332,15 +332,12 @@ sequenceDiagram
 | price_below_val_fades_long | MON-011-R3 | unit | Given a D profile and price below VAL with 2 factors agreeing LONG, when evaluate runs, then a Lower alert fading LONG. |
 | price_inside_the_value_area_never_alerts | MON-011-R3 | unit | Given a D profile, price between VAL and VAH, all factors agreeing, when evaluate runs, then no alert. |
 | an_irregular_profile_never_alerts | MON-011-R3 | unit | Given a double distribution with price above VAH and all factors agreeing, when evaluate runs, then no alert. |
-| two_of_three_agreeing_with_the_fade_alerts | MON-011-R4 | unit | Given price above VAH, structure bearish, delta -800, other timeframe leaning Long, when evaluate runs, then an alert with 2 of 3 agreeing. |
-| one_of_three_does_not_alert | MON-011-R4 | unit | Given price above VAH, structure bearish, delta +800, other timeframe leaning Long, when evaluate runs, then no alert. |
-| neutral_factors_do_not_count | MON-011-R4 | unit | Given price above VAH, structure bearish, delta -300 (under the gate), no composite, when evaluate runs, then no alert: only 1 factor agrees. |
+| a_candidate_carries_every_read_even_below_two_of_three | MON-011-R4 | unit | Given a bell profile, price above VAH, structure agreeing with the short fade, order flow and the other timeframe against, when va_alert::candidate runs at that price and inside the value area, then a candidate fading SHORT with reads agree/against/against and 1 agreeing; none inside the value area. |
 | one_alert_per_period | MON-011-R5 | unit | Given an alert sent in RTH period C, when the conditions hold again later in period C without a POC cross, then nothing is sent. |
 | a_poc_cross_re_arms_within_the_period | MON-011-R5 | unit | Given an alert sent above VAH in period C, then price trades through the POC, when price goes back above VAH in period C with the conditions met, then a second alert is sent. |
 | a_new_period_re_arms | MON-011-R5 | unit | Given an alert sent in period C, when the conditions hold in period D, then a new alert is sent. |
 | the_text_profile_marks_vah_poc_val_and_price | MON-011-R6 | unit | Given a profile with VAH, POC, VAL and price on different rows, when render_profile runs, then the rows carry VAH, POC, VAL markers and the price arrow, highest price first. |
 | the_text_profile_fits_in_24_rows | MON-011-R6 | unit | Given a 60-point range at 0.25 ticks (240 levels), when render_profile runs, then it uses at most 24 rows. |
-| va_alert_message_shows_alignment_and_profile | MON-011-R6 | unit | Given an Upper SHORT alert on a P profile with structure and order flow agreeing, when telegram::va_alert_message runs, then it shows '[V2] VALUE AREA — MESZ6', 'above VAH', 'fade SHORT', 'P', 2/3 aligned, each factor and the profile block. |
 
 ## MON-012 — Telegram carries only won/lost shadow-trade results, the value-area alert, the daily summary and market-data outage alerts
 
@@ -573,7 +570,7 @@ sequenceDiagram
 
 | ID | Requirement |
 | --- | --- |
-| MON-021-R1 | WHEN the trading rules are read THEN the execution config SHALL be [execution] mode, strategies and account_daily_loss_cap_usd, with autotrade from [platform.ib_tws] and the strategy caps from [daily_loss_cap]; a missing [execution] SHALL mean mode off |
+| MON-021-R1 | WHEN the trading rules are read THEN the execution config SHALL be [execution] paper, live, autotrade and account_daily_loss_cap_usd (MON-023; v1's [platform.ib_tws] autotrade_enabled is not read), with the strategy caps from [daily_loss_cap]; a missing [execution] SHALL mean nothing executes |
 | MON-021-R2 | WHEN a shadow trade is recorded for a listed strategy THEN the checks SHALL use that strategy's and the account's realized dollars today in the configured mode, the strategy cap from [daily_loss_cap], the kill-switch file, and the go-live gate only in live mode |
 
 ### Scenarios
@@ -583,4 +580,51 @@ sequenceDiagram
 | execution_config_is_read_from_trading_rules | MON-021-R1 | unit | Given a trading_rules.toml with mode paper, two strategies, cap 100, autotrade false, MES cap 100, when exec::read_config runs, then Paper, the two slugs, Some(100), autotrade false, MES -> 100. |
 | missing_execution_section_means_off | MON-021-R1 | unit | Given a trading_rules.toml without [execution], when exec::read_config runs, then mode Off, no strategies, no account cap. |
 | checks_use_todays_realized_dollars_and_the_caps | MON-021-R2 | unit | Given realized today: va60 -100, va80 -20; MES cap 100, when exec::checks runs for va60 and for va80, then va60 refused by its own cap; va80 allowed by its own cap; account realized -120 for both. |
+
+## MON-022 — The value-area alert drops the structure and order-flow votes and the 2-of-3 count: it fires unless the other timeframe is against the fade, in RTH and Globex, and the message gives the POC target, an 8-point stop, the 30-minute range and net large prints
+
+**Status:** accepted
+
+**Context:** User decision 2026-10-26, from the MON-011 study (bilore-ml-rs/docs/findings/2026-10-26-va-alert-factors.md; bin/backtest_va_alert replays the live code and matched 21 of 25 live alerts). 49 complete RTH + 8 Globex sessions, 534 setups, entry at the alert price, 2 ticks cost: the 2-of-3 alerts did no better than the setups they rejected (POC target, 6-pt stop: +0.23 vs -0.06 pt). Order flow agreeing with the fade was worse in every geometry, both halves and RTH alone (-0.9 to -1.2 pt/trade; 6/6 bootstrap CI -1.97..-0.03); structure had no consistent sign; the other timeframe against was worse (-0.8 to -1.2; 6/6 CI -2.19..-0.02). Other timeframe not against: 234 setups, 41 sessions, POC target with an 8-point stop 64% win, +1.05 pt (H1 +1.03, H2 +1.07); RTH 177, 58%, +0.43 (H1 +1.03, H2 -0.50); Globex 57 in 7 sessions, 79%, +2.97. An 8-point stop beat 4 and 6 with the POC as target in every subset. Quiet market (30-min range < 10) reached the POC 60% vs 47% but not fixed targets, and large prints net with the fade were a small plus: info lines, not filters. The user wants it in RTH too, to learn whether it works there.
+
+**Consequences:** + the alert stops counting a factor that pointed the wrong way. + every alert carries a plan (target, stop). - about 5 setups per session pass instead of ~1.3 (the throttle still allows one per period unless the POC is crossed). - RTH evidence is weak and its recent half negative; re-run bin/backtest_va_alert as sessions accumulate. - the rule was chosen after looking at the data: a forward test.
+
+### Requirements
+
+| ID | Requirement |
+| --- | --- |
+| MON-022-R1 | WHEN a candidate's other timeframe is against the fade THEN no alert SHALL fire; otherwise it SHALL fire whatever structure and order flow read (neutral or unavailable other timeframe included) |
+| MON-022-R2 | WHEN an alert is built THEN its stop SHALL be 8 points beyond the entry price, and the tape SHALL report the last 30 minutes' range (quiet under 10 points) and the session's large prints (50+ contracts) by aggressor side, restarting each session |
+| MON-022-R3 | WHEN the alert is sent THEN the message SHALL show the side, fade direction, shape, session and period, the POC target with its distance, the stop, the other timeframe's read, quiet or active with the 30-minute range, net large prints with or against the fade, and VAH/POC/VAL, and SHALL not show structure, order flow or an alignment count |
+
+### Scenarios
+
+| ID | Requirement | Layer | Scenario |
+| --- | --- | --- | --- |
+| structure_and_order_flow_no_longer_decide | MON-022-R1 | unit | Given price above VAH of a bell profile, structure bullish, delta +800, no other-timeframe lean, when va_alert::evaluate runs, then an alert: structure and order flow read against, the other timeframe neutral. |
+| the_other_timeframe_against_vetoes_the_alert | MON-022-R1 | unit | Given price above VAH, structure bearish and delta -800 (both with the short fade), the other timeframe leaning Long; then only the other timeframe, leaning Short, when va_alert::evaluate runs, then no alert, then an alert. |
+| the_alert_carries_an_8_point_stop_beyond_the_entry | MON-022-R2 | unit | Given a short fade at 5009 and a long fade at 5002, when Alert::stop runs, then 5017 and 4994. |
+| the_tape_reads_the_30_minute_range_and_net_large_prints | MON-022-R2 | unit | Given a 60-lot buy 70 minutes earlier, a 50-lot sell, a 3-lot sell and an 80-lot buy within 30 minutes spanning 5001-5009, when Tape::context runs, then again after a trade at 5012, then range 8, 2 large buys and 1 large sell, quiet, net -1 for a short; then not quiet. |
+| the_tape_restarts_with_the_session | MON-022-R2 | unit | Given an RTH large print at 14:50, then a Globex trade at 17:01, when Tape::context runs at 17:01, then range 0 and no large prints. |
+| va_alert_message_shows_the_trade_plan_and_profile | MON-022-R3 | unit | Given an Upper SHORT alert at 5009.25 on a P profile, POC 5005, a 7.5-point 30-minute range, 1 large buy and 3 large sells; then a 14-point range with 2 large buys, when telegram::va_alert_message runs, then target POC 5005.00 (4.25 pt), stop 5017.25 (8 pt), the other timeframe's read, quiet, large prints +2 with the fade, the profile block, and no structure, order flow or alignment; then active and -2 against the fade. |
+
+## MON-023 — Each strategy executes in its own mode: the monitor reads [execution] paper and live lists and [execution] autotrade, and publishes a strategy's intent on its mode's subject (bilore-specs SYS-014)
+
+**Status:** accepted
+
+**Context:** User, 2026-10-26: fade-roll-overnight live on MES, the other strategies on paper (SYS-014, SYS-015). maybe_execute takes the mode from ExecConfig::mode_for(slug), reads that mode's realized dollars for the caps, checks the go-live gate only for live, and publishes on intent_subject(mode). The old single mode/strategies keys and a strategy in both lists are config errors: logged, nothing executes.
+
+**Consequences:** + paper and live run side by side. - a config left in the old shape stops all execution until migrated (fail closed).
+
+### Requirements
+
+| ID | Requirement |
+| --- | --- |
+| MON-023-R1 | WHEN the trading rules are read THEN [execution] paper and live SHALL give each strategy's mode, [execution] autotrade the live switch, and the old mode/strategies keys or a strategy in both lists SHALL be refused |
+
+### Scenarios
+
+| ID | Requirement | Layer | Scenario |
+| --- | --- | --- | --- |
+| the_old_single_mode_and_a_strategy_in_both_lists_are_refused | MON-023-R1 | unit | Given [execution] mode = paper with strategies; then fade-roll-overnight in both paper and live, when exec::read_config runs, then an error naming SYS-014; then an error saying both paper and live. |
 

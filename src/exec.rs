@@ -30,12 +30,6 @@ pub fn read_config(toml_text: &str) -> Result<ExecSettings, String> {
             _ => None,
         }
     };
-    let autotrade_enabled = v
-        .get("platform")
-        .and_then(|p| p.get("ib_tws"))
-        .and_then(|t| t.get("autotrade_enabled"))
-        .and_then(|a| a.as_bool())
-        .unwrap_or(false);
     let caps: Vec<(String, Decimal)> = v
         .get("daily_loss_cap")
         .and_then(|t| t.as_table())
@@ -43,19 +37,23 @@ pub fn read_config(toml_text: &str) -> Result<ExecSettings, String> {
         .unwrap_or_default();
     let caps = LossCapConfig::new(caps.iter().map(|(r, c)| (r.as_str(), *c)));
     let e = v.get("execution");
-    let mode = match e.and_then(|e| e.get("mode")).and_then(|m| m.as_str()).unwrap_or("off") {
-        "paper" => bilore_core::execution::ExecMode::Paper,
-        "live" => bilore_core::execution::ExecMode::Live,
-        "off" => bilore_core::execution::ExecMode::Off,
-        other => return Err(format!("[execution] mode must be off, paper or live, not {other:?}")),
+    // SYS-014: one mode per strategy. The old single `mode` + `strategies`
+    // is refused, so nothing executes until the config is migrated.
+    if e.is_some_and(|e| e.get("mode").is_some() || e.get("strategies").is_some()) {
+        return Err("[execution] mode/strategies were replaced by per-strategy paper = [...] and live = [...] lists (SYS-014)".into());
+    }
+    let list = |key: &str| -> Vec<String> {
+        e.and_then(|e| e.get(key))
+            .and_then(|s| s.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
     };
-    let strategies = e
-        .and_then(|e| e.get("strategies"))
-        .and_then(|s| s.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-        .unwrap_or_default();
+    // v2's own live switch; v1's [platform.ib_tws] autotrade_enabled drives v1 only.
+    let autotrade_enabled = e.and_then(|e| e.get("autotrade")).and_then(|a| a.as_bool()).unwrap_or(false);
     let account_cap = e.and_then(|e| e.get("account_daily_loss_cap_usd")).and_then(num);
-    Ok(ExecSettings { exec: ExecConfig { mode, strategies, account_cap }, autotrade_enabled, caps })
+    let exec = ExecConfig { paper: list("paper"), live: list("live"), account_cap };
+    exec.validate()?;
+    Ok(ExecSettings { exec, autotrade_enabled, caps })
 }
 
 /// The gate's inputs for `slug` right now. `realized` is today's realized
@@ -98,31 +96,43 @@ mod tests {
 
     const RULES: &str = r#"
 [platform.ib_tws]
-autotrade_enabled  = false
+autotrade_enabled  = true   # v1's switch: v2 must not read it (SYS-014)
 
 [daily_loss_cap]
 MES = 100.0
 
 [execution]
-mode       = "paper"
-strategies = ["fade-priorpoc-va60-1r", "fade-priorpoc-va80-1.5r"]
+autotrade = false
+paper = ["fade-priorpoc-va60-1r", "fade-priorpoc-va80-1.5r"]
+live  = ["fade-roll-overnight"]
 account_daily_loss_cap_usd = 100
 "#;
 
     #[test]
     fn execution_config_is_read_from_trading_rules() {
         let s = read_config(RULES).unwrap();
-        assert_eq!(s.exec.mode, ExecMode::Paper);
-        assert_eq!(s.exec.strategies, vec!["fade-priorpoc-va60-1r".to_string(), "fade-priorpoc-va80-1.5r".to_string()]);
+        assert_eq!(s.exec.paper, vec!["fade-priorpoc-va60-1r".to_string(), "fade-priorpoc-va80-1.5r".to_string()]);
+        assert_eq!(s.exec.live, vec!["fade-roll-overnight".to_string()]);
+        assert_eq!(s.exec.mode_for("fade-roll-overnight"), ExecMode::Live);
         assert_eq!(s.exec.account_cap, Some(d("100")));
-        assert!(!s.autotrade_enabled);
+        assert!(!s.autotrade_enabled, "[execution] autotrade, not v1's [platform.ib_tws] autotrade_enabled");
         assert_eq!(s.caps.cap_for("MESZ6"), Some(d("100")));
+        let on = read_config(&RULES.replace("autotrade = false", "autotrade = true")).unwrap();
+        assert!(on.autotrade_enabled);
     }
 
     #[test]
     fn missing_execution_section_means_off() {
-        let s = read_config("[platform.ib_tws]\nautotrade_enabled = false\n").unwrap();
-        assert_eq!((s.exec.mode, s.exec.strategies.len(), s.exec.account_cap), (ExecMode::Off, 0, None));
+        let s = read_config("[platform.ib_tws]\nautotrade_enabled = true\n").unwrap();
+        assert_eq!((s.exec.paper.len(), s.exec.live.len(), s.exec.account_cap, s.autotrade_enabled), (0, 0, None, false));
+    }
+
+    #[test]
+    fn the_old_single_mode_and_a_strategy_in_both_lists_are_refused() {
+        let old = "[execution]\nmode = \"paper\"\nstrategies = [\"fade-priorpoc-2r\"]\n";
+        assert!(read_config(old).unwrap_err().contains("SYS-014"));
+        let both = "[execution]\npaper = [\"fade-roll-overnight\"]\nlive = [\"fade-roll-overnight\"]\n";
+        assert!(read_config(both).unwrap_err().contains("both paper and live"));
     }
 
     #[test]

@@ -410,6 +410,8 @@ struct VaState {
     composite: Option<(ReferenceProfile, ReferenceProfile, ReferenceProfile)>,
     throttle: va_alert::AlertThrottle,
     last_price: Option<Decimal>,
+    /// MON-022 info lines: 30-minute range and the session's large prints.
+    tape: va_alert::Tape,
 }
 
 impl Default for VaState {
@@ -423,6 +425,7 @@ impl Default for VaState {
             composite: None,
             throttle: va_alert::AlertThrottle::default(),
             last_price: None,
+            tape: va_alert::Tape::default(),
         }
     }
 }
@@ -1149,10 +1152,12 @@ async fn main() -> Result<()> {
                     if let Some(bar) = state.va.bars.on_tick(tick) {
                         state.va.session_bars.push(bar);
                     }
-                    state.va.delta += match state.va.classifier.classify(tick.price) {
+                    let side = state.va.classifier.classify(tick.price);
+                    state.va.delta += match side {
                         bilore_core::order_flow::Side::Buy => tick.size,
                         bilore_core::order_flow::Side::Sell => -tick.size,
                     };
+                    state.va.tape.on_trade(tick_ct, tick.price, tick.size, side);
                     if let Some(poc) = state.va.profile.volume.poc() {
                         state.va.throttle.observe(tick.price, poc);
                     }
@@ -1166,11 +1171,11 @@ async fn main() -> Result<()> {
                         if let Some(alert) = va_alert::evaluate(&state.va.profile, tick_ct, tick.price, &factors, state.tick_size) {
                             if state.va.throttle.should_send(&alert) {
                                 let text = va_alert::render_profile(&state.va.profile.volume, alert.vah, alert.poc, alert.val, alert.price, state.tick_size, 24);
-                                let mut msg = telegram::va_alert_message(symbol, &alert, &text);
+                                let mut msg = telegram::va_alert_message(symbol, &alert, &state.va.tape.context(tick_ct), &text);
                                 if let Err(block) = state.vol.may_open(tick_ct) {
                                     msg.push_str(&format!("\n⚠️ {block} — the strategies take no new setups right now"));
                                 }
-                                tracing::info!("{symbol}: value-area alert {:?} fade {:?} at {}, {}/3 aligned", alert.side, alert.fade, alert.price, alert.agreeing());
+                                tracing::info!("{symbol}: value-area alert {:?} fade {:?} at {}, other timeframe {:?}, {}/3 aligned", alert.side, alert.fade, alert.price, alert.otf, alert.agreeing());
                                 notify(&http, &bot_token, &chat_id, &msg).await;
                                 sound::play(sound::AlertKind::ValueArea);
                             }
@@ -1672,11 +1677,11 @@ fn trading_rules_path() -> std::path::PathBuf {
 
 /// MON-021 (SYS-009-R1): after a shadow trade is recorded, publish it as an
 /// order intent if `[execution]` lists the strategy and bilore-core's gate
-/// allows it. The config and the kill switch are re-read every time. The
+/// allows it, on its own mode's subject (MON-023, SYS-014). The config and the kill switch are re-read every time. The
 /// volatility block is always clear here: a setup is only created after
 /// `gate_allows` passed on this same tick.
 async fn maybe_execute(pool: &PgPool, symbol: &str, slug: &str, trade_id: i64, trade: &ShadowTrade) {
-    use bilore_core::execution::{may_execute, ExecMode, OrderIntent, INTENT_SUBJECT};
+    use bilore_core::execution::{intent_subject, may_execute, ExecMode, OrderIntent};
     let settings = match std::fs::read_to_string(trading_rules_path()).map_err(|e| e.to_string()).and_then(|t| exec::read_config(&t)) {
         Ok(s) => s,
         Err(e) => {
@@ -1684,10 +1689,12 @@ async fn maybe_execute(pool: &PgPool, symbol: &str, slug: &str, trade_id: i64, t
             return;
         }
     };
-    if settings.exec.mode == ExecMode::Off || !settings.exec.strategies.iter().any(|s| s == slug) {
+    // SYS-014: each strategy has its own mode; caps and realized P&L are that mode's account.
+    let listed = settings.exec.mode_for(slug);
+    if listed == ExecMode::Off {
         return;
     }
-    let mode_name = if settings.exec.mode == ExecMode::Live { "live" } else { "paper" };
+    let mode_name = if listed == ExecMode::Live { "live" } else { "paper" };
     let today = Utc::now().with_timezone(&Chicago).date_naive();
     let realized = match db::realized_today(pool, mode_name, today).await {
         Ok(r) => r,
@@ -1696,7 +1703,7 @@ async fn maybe_execute(pool: &PgPool, symbol: &str, slug: &str, trade_id: i64, t
             return;
         }
     };
-    let gate_passed = settings.exec.mode == ExecMode::Live
+    let gate_passed = listed == ExecMode::Live
         && match db::fetch_resolved_gate_rows(pool, &["MES"]).await {
             Ok(rows) => {
                 let gates = gate::compute_gates(&gate::group_by_strategy(&rows), &[slug], &gate::TRUST_CFG);
@@ -1732,7 +1739,7 @@ async fn maybe_execute(pool: &PgPool, symbol: &str, slug: &str, trade_id: i64, t
         return;
     }
     let payload = serde_json::to_vec(&intent).unwrap_or_default();
-    match js.publish(INTENT_SUBJECT, payload.into()).await {
+    match js.publish(intent_subject(mode), payload.into()).await {
         Ok(ack) => match ack.await {
             Ok(_) => tracing::info!(
                 "{symbol} INTENT [{slug}] #{trade_id} {mode_name}: {} entry={} stop={} target={:?}",
