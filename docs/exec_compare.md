@@ -11,7 +11,7 @@ their shadow trades, and flags a divergence.
 flowchart TD
     P["live_orders JOIN shadow_trades_v2 ON trade_id"] --> C{"compare"}
     C -- "both finished" --> B["same / other outcome\n(target-won, stop-lost, close-expired)"]
-    C -- "shadow traded, order cancelled unfilled" --> M["missed fill"]
+    C -- "shadow traded, order cancelled unfilled or rejected" --> M["missed fill"]
     C -- "order filled, shadow never entered" --> E["extra fill"]
     C -- "open, or neither traded" --> X["left out"]
     B & M & E --> T["Tally: counts, real $ vs shadow $, gap, t"]

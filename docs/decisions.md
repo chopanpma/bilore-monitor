@@ -684,7 +684,7 @@ sequenceDiagram
 
 | ID | Requirement |
 | --- | --- |
-| MON-026-R1 | WHEN an executed order and its shadow trade have both finished THEN they SHALL compare as same or other outcome; an unfilled order whose shadow trade traded SHALL be a missed fill, a filled order whose shadow trade never entered an extra fill; open pairs and pairs where neither traded SHALL not compare |
+| MON-026-R1 | WHEN an executed order and its shadow trade have both finished THEN they SHALL compare as same or other outcome; an order cancelled unfilled or rejected by IB (BML-015) whose shadow trade traded SHALL be a missed fill, a filled order whose shadow trade never entered an extra fill; open pairs and pairs where neither traded SHALL not compare |
 | MON-026-R2 | WHEN at least 5 trades compare and the average gap is at least $2.50 per trade with \|t\| >= 2, or more than 20% disagree THEN the strategy SHALL be flagged diverged; with fewer it SHALL not |
 | MON-026-R3 | WHEN the daily summary is sent and anything was ever executed THEN it SHALL end with a shadow vs paper/live section per strategy and mode: today's comparison when there is one, the running total and the verdict |
 
@@ -692,7 +692,7 @@ sequenceDiagram
 
 | ID | Requirement | Layer | Scenario |
 | --- | --- | --- | --- |
-| each_order_is_compared_with_its_shadow_trade | MON-026-R1 | unit | Given orders closed at target/stop/close against won/lost/expired shadow trades, a cancelled order against a won one, a filled order against an invalidated one, and open pairs, when exec_compare::compare runs, then same, same, same, other outcome, missed fill, extra fill, nothing for neither-traded and open. |
+| each_order_is_compared_with_its_shadow_trade | MON-026-R1 | unit | Given orders closed at target/stop/close against won/lost/expired shadow trades, a cancelled and a rejected order against won ones, a filled order against an invalidated one, and open pairs, when exec_compare::compare runs, then same, same, same, other outcome, missed fill, extra fill, nothing for neither-traded and open. |
 | small_or_few_gaps_are_not_a_divergence | MON-026-R2 | unit | Given the 7 paper pairs of 2026-10-21..23 (+$23.75), and 2 disagreeing pairs, when Tally::diverged runs, then not diverged either time. |
 | a_consistent_gap_or_too_many_disagreements_is_a_divergence | MON-026-R2 | unit | Given 6 pairs each about $12 worse than shadow; 8 pairs with 2 missed fills, when Tally::diverged runs, then diverged both times. |
 | the_section_shows_today_the_total_and_the_verdict | MON-026-R3 | unit | Given three paper pairs of fade-priorpoc-va80-1.5r (one missed fill today) and one live fade-roll-overnight pair, when exec_compare::section runs for 2026-10-23, then per strategy and mode a Today line, a Total line with real vs shadow $ and the gap, 'ok so far'; nothing when no order exists. |

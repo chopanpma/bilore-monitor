@@ -1281,7 +1281,7 @@ decision MON-026 "The daily summary compares every executed order with its shado
 
 spec MON-026 {
   requirement MON-026-R1 (EARS) {
-    text: "WHEN an executed order and its shadow trade have both finished THEN they SHALL compare as same or other outcome; an unfilled order whose shadow trade traded SHALL be a missed fill, a filled order whose shadow trade never entered an extra fill; open pairs and pairs where neither traded SHALL not compare"
+    text: "WHEN an executed order and its shadow trade have both finished THEN they SHALL compare as same or other outcome; an order cancelled unfilled or rejected by IB (BML-015) whose shadow trade traded SHALL be a missed fill, a filled order whose shadow trade never entered an extra fill; open pairs and pairs where neither traded SHALL not compare"
     layers: [unit]
     scenarios: [each_order_is_compared_with_its_shadow_trade]
   }
@@ -1296,7 +1296,7 @@ spec MON-026 {
     scenarios: [the_section_shows_today_the_total_and_the_verdict]
   }
   scenario each_order_is_compared_with_its_shadow_trade {
-    given: "orders closed at target/stop/close against won/lost/expired shadow trades, a cancelled order against a won one, a filled order against an invalidated one, and open pairs"
+    given: "orders closed at target/stop/close against won/lost/expired shadow trades, a cancelled and a rejected order against won ones, a filled order against an invalidated one, and open pairs"
     when: "exec_compare::compare runs"
     then: "same, same, same, other outcome, missed fill, extra fill, nothing for neither-traded and open"
     # delegates: exec_compare::tests::each_order_is_compared_with_its_shadow_trade

@@ -26,7 +26,7 @@ pub struct Pair {
     pub mode: String,
     pub strategy: String,
     pub trading_date: NaiveDate,
-    /// live_orders.status: placing | working | filled | closed | cancelled
+    /// live_orders.status: placing | working | filled | closed | cancelled | rejected
     pub status: String,
     /// live_orders.exit_reason: target | stop | close | cancel
     pub exit_reason: Option<String>,
@@ -65,7 +65,7 @@ pub fn compare(p: &Pair) -> Option<Compared> {
     let shadow_traded = matches!(p.shadow_outcome.as_str(), "won" | "lost" | "expired");
     let shadow_open = matches!(p.shadow_outcome.as_str(), "pending" | "entered");
     let real_done = p.status == "closed";
-    let real_unfilled = p.status == "cancelled" && p.realized_usd.is_none();
+    let real_unfilled = matches!(p.status.as_str(), "cancelled" | "rejected") && p.realized_usd.is_none();
     let shadow_usd = p.shadow_usd.unwrap_or(0.0);
     if real_done && shadow_traded {
         let same = matches!(
@@ -236,6 +236,8 @@ mod tests {
         assert_eq!(compare(&pair(s, 21, "cancelled", Some("cancel"), None, "won", Some(75.0))), Some(Compared::Missed { shadow: 75.0 }), "shadow traded, the order never filled");
         assert_eq!(compare(&pair(s, 21, "closed", Some("stop"), Some(-50.0), "invalidated", None)), Some(Compared::Extra { real: -50.0 }));
         assert_eq!(compare(&pair(s, 21, "cancelled", Some("cancel"), None, "invalidated", None)), None, "neither traded");
+        assert_eq!(compare(&pair(s, 27, "rejected", None, None, "won", Some(60.0))), Some(Compared::Missed { shadow: 60.0 }), "IB rejected it (BML-015)");
+        assert_eq!(compare(&pair(s, 27, "rejected", None, None, "invalidated", None)), None);
         assert_eq!(compare(&pair(s, 21, "filled", None, None, "entered", None)), None, "still open");
         assert_eq!(compare(&pair(s, 21, "closed", Some("stop"), Some(-50.0), "entered", None)), None, "shadow still open");
     }
