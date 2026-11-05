@@ -84,6 +84,21 @@ pub fn checks(
     }
 }
 
+/// SYS-001-R2: the cap book from the caps saved in strategy_caps, so a cap
+/// survives a restart and `bilore enable` applies without one.
+pub fn book_from(saved: &[(String, NaiveDate)]) -> LossCapBook {
+    let mut book = LossCapBook::default();
+    for (slug, capped_on) in saved {
+        book.restore(slug, *capped_on);
+    }
+    book
+}
+
+/// The day `slug` was capped, if `checks` just capped it (not yet in `saved`).
+pub fn newly_capped(saved: &[(String, NaiveDate)], book: &LossCapBook, slug: &str) -> Option<NaiveDate> {
+    book.capped_on(slug).filter(|_| !saved.iter().any(|(s, _)| s == slug))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +163,35 @@ account_daily_loss_cap_usd = 100
         assert_eq!(va80.strategy_cap, Entry::Allowed);
         assert_eq!((va80.account_realized_today, va80.volatility_block, va80.kill_switch), (d("-120"), true, true));
         assert!(!va80.autotrade_enabled && !va80.gate_passed);
+    }
+
+    #[test]
+    fn a_saved_cap_survives_a_restart() {
+        let s = read_config(RULES).unwrap();
+        let (capped_on, tomorrow) = (NaiveDate::from_ymd_opt(2026, 11, 5).unwrap(), NaiveDate::from_ymd_opt(2026, 11, 6).unwrap());
+        let mut book = book_from(&[("fade-priorpoc-va60-1r".to_string(), capped_on)]);
+        let c = checks(&s, "fade-priorpoc-va60-1r", "MESZ6", &[], &mut book, tomorrow, false, false, false);
+        assert_eq!(c.strategy_cap, Entry::Refused(Refusal::AwaitingReEnable { capped_on }));
+    }
+
+    #[test]
+    fn only_a_cap_not_already_saved_is_new() {
+        let s = read_config(RULES).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
+        let slug = "fade-priorpoc-va60-1r";
+        let realized = vec![(slug.to_string(), d("-100"))];
+
+        let mut fresh = book_from(&[]);
+        checks(&s, slug, "MESZ6", &realized, &mut fresh, today, false, false, false);
+        assert_eq!(newly_capped(&[], &fresh, slug), Some(today), "reached the cap just now");
+
+        let saved = vec![(slug.to_string(), today)];
+        let mut restored = book_from(&saved);
+        checks(&s, slug, "MESZ6", &realized, &mut restored, today, false, false, false);
+        assert_eq!(newly_capped(&saved, &restored, slug), None, "already saved");
+
+        let mut under = book_from(&[]);
+        checks(&s, slug, "MESZ6", &[], &mut under, today, false, false, false);
+        assert_eq!(newly_capped(&[], &under, slug), None, "not capped");
     }
 }

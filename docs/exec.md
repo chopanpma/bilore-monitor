@@ -11,7 +11,10 @@ After a shadow trade is recorded, `maybe_execute`:
    old `mode` / `strategies` keys or a strategy in both lists: a config error, logged, nothing
    executes;
 2. reads today's realized dollars per strategy from `live_orders` in that strategy's mode (its
-   account), the go-live gate (live only), and the kill-switch file `~/.config/bilore/kill_switch`;
+   account), the go-live gate (live only), the kill-switch file `~/.config/bilore/kill_switch`, and
+   the saved caps from `strategy_caps` (SYS-001-R2; unreadable: nothing executes). A strategy that
+   just reached its cap is saved there and reported on Telegram; `bilore enable <strategy>` clears
+   it, without a restart;
 3. asks `bilore_core::execution::may_execute`. Allowed: publishes `OrderIntent::new_order` on
    `intent_subject(mode)` = `bilore.order.intent.paper` / `.live` through JetStream (stream
    `BILORE_ORDERS`, created if missing) and logs `INTENT [slug] #id <mode>: …`. Refused: logs
@@ -23,7 +26,7 @@ Follow-ups (cancel/close) aren't sent: the executor follows the shadow row's out
 |---|---|---|
 | `read_config()` | `[execution]` `paper`, `live`, `autotrade` (v2's live switch; v1's `[platform.ib_tws] autotrade_enabled` is not read) and the account cap; `[daily_loss_cap]` | `execution_config_is_read_from_trading_rules`, `missing_execution_section_means_off`, `the_old_single_mode_and_a_strategy_in_both_lists_are_refused` |
 | `checks()` | The gate inputs; SYS-001 book with live semantics in both modes | `checks_use_todays_realized_dollars_and_the_caps` |
+| `book_from()` / `newly_capped()` | The cap book from the saved caps; whether this check just capped the strategy | `a_saved_cap_survives_a_restart`, `only_a_cap_not_already_saved_is_new` |
 | `kill_switch_path()` | `~/.config/bilore/kill_switch` | — |
 
-Known limits: the per-strategy cap book is in memory (a restart re-enables a capped strategy);
-a failed publish leaves that trade shadow-only (logged as an error).
+Known limits: a failed publish leaves that trade shadow-only (logged as an error).

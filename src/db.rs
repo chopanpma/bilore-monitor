@@ -346,6 +346,23 @@ pub async fn realized_today(pool: &PgPool, mode: &str, day: NaiveDate) -> Result
     .await?)
 }
 
+/// SYS-001-R2: strategies stopped by their cap and not re-enabled since.
+pub async fn saved_caps(pool: &PgPool) -> Result<Vec<(String, NaiveDate)>> {
+    Ok(sqlx::query_as("SELECT strategy, capped_on FROM strategy_caps WHERE re_enabled_at IS NULL")
+        .fetch_all(pool)
+        .await?)
+}
+
+/// SYS-001-R2: save a cap; `bilore enable <strategy>` clears it.
+pub async fn save_cap(pool: &PgPool, strategy: &str, capped_on: NaiveDate) -> Result<()> {
+    sqlx::query("INSERT INTO strategy_caps (strategy, capped_on) VALUES ($1, $2) ON CONFLICT (strategy) WHERE re_enabled_at IS NULL DO NOTHING")
+        .bind(strategy)
+        .bind(capped_on)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// High and low of `symbol`'s recorded trades from `from` to `to` (Chicago
 /// wall clock) — MON-017's overnight range (prior RTH 15:00 -> 08:30).
 pub async fn price_range(

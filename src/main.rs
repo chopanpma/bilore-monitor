@@ -1730,8 +1730,6 @@ async fn try_wide_signal(
 
 /// MON-021: the NATS client order intents go out on (set at startup).
 static EXEC_NATS: std::sync::OnceLock<async_nats::Client> = std::sync::OnceLock::new();
-/// MON-021: SYS-001's per-strategy cap book for executed strategies (in memory).
-static EXEC_BOOK: std::sync::OnceLock<std::sync::Mutex<bilore_core::loss_cap::LossCapBook>> = std::sync::OnceLock::new();
 
 fn trading_rules_path() -> std::path::PathBuf {
     std::env::var("BILORE_TRADING_RULES").map(Into::into).unwrap_or_else(|_| {
@@ -1776,10 +1774,24 @@ async fn maybe_execute(pool: &PgPool, symbol: &str, slug: &str, trade_id: i64, t
             Err(_) => false,
         };
     let kill = exec::kill_switch_path().exists();
-    let checks = {
-        let mut book = EXEC_BOOK.get_or_init(Default::default).lock().unwrap();
-        exec::checks(&settings, slug, symbol, &realized, &mut book, today, gate_passed, false, kill)
+    // SYS-001-R2: the caps live in strategy_caps, re-read every time like the config.
+    let saved = match db::saved_caps(pool).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("{symbol}: [{slug}] #{trade_id} not executed — strategy_caps unreadable: {e}");
+            return;
+        }
     };
+    let mut book = exec::book_from(&saved);
+    let checks = exec::checks(&settings, slug, symbol, &realized, &mut book, today, gate_passed, false, kill);
+    if let Some(capped_on) = exec::newly_capped(&saved, &book, slug) {
+        if let Err(e) = db::save_cap(pool, slug, capped_on).await {
+            tracing::error!("{symbol}: [{slug}] cap not saved: {e}");
+        }
+        let (token, chat) = (std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(), std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default());
+        let text = format!("🛑 <b>[V2][{slug}] STOPPED — daily loss cap</b> ({mode_name})\nStays shadow-only, also on later days, until: <code>bilore enable {slug}</code>");
+        notify(&reqwest::Client::new(), &token, &chat, &text).await;
+    }
     let mode = match may_execute(&settings.exec, slug, &checks) {
         Ok(m) => m,
         Err(blocked) => {
