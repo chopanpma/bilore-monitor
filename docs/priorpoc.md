@@ -1,5 +1,7 @@
 # priorpoc
 
+**2026-11-05 (MON-027): fade-priorpoc-2r retired on the shadow record; the code stays, and `strategy::is_active` keeps it from arming.**
+
 Source: `src/priorpoc.rs` (pure) · wired in `main.rs` (`try_priorpoc_signal`,
 `fetch_prior_rth_pct`, the per-tick RTH block and the 15:00 close) · New 2026-10-18 (MON-016).
 Strategy `fade-priorpoc-2r`, registered in `bilore-project-conf/contracts/strategies.md`.

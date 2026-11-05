@@ -697,3 +697,23 @@ sequenceDiagram
 | a_consistent_gap_or_too_many_disagreements_is_a_divergence | MON-026-R2 | unit | Given 6 pairs each about $12 worse than shadow; 8 pairs with 2 missed fills, when Tally::diverged runs, then diverged both times. |
 | the_section_shows_today_the_total_and_the_verdict | MON-026-R3 | unit | Given three paper pairs of fade-priorpoc-va80-1.5r (one missed fill today) and one live fade-roll-overnight pair, when exec_compare::section runs for 2026-10-23, then per strategy and mode a Today line, a Total line with real vs shadow $ and the gap, 'ok so far'; nothing when no order exists. |
 
+## MON-027 — The three prior-POC fades leave shadow: two lose clearly and the third is flat and fading
+
+**Status:** accepted
+
+**Context:** User decision 2026-11-05 ('time to deprecate the shadow strategies that aren't working'; chose fade-priorpoc-va80-1.5r as well when asked). Shadow won/lost record 2026-10-21..2026-11-03: fade-priorpoc-2r 9 resolved, 1 won, 11.1%, -26.7 ticks/trade, -$300, both halves negative; fade-priorpoc-va60-1r 13 resolved, 3 won, 23.1%, -32.3 ticks/trade, -$525, both halves negative; fade-priorpoc-va80-1.5r 12 resolved, 5 won, 41.7%, +1.7 ticks/trade, +$25, first half +$200, second half -$175. Backtests on 51 complete sessions had been positive (2r +$314, va60 +$545, va80 +$605); forward results did not hold that up. fade-va-alert stays: 42 resolved, 59.5%, +1.8 ticks/trade, +$94, flat but only 8 days old (user decision).
+
+**Consequences:** + Results concentrate on fade-roll-overnight (live), fade-roll-evening and fade-va-alert, and the paper account stops carrying rules that lose. + Removing them costs the live strategy nothing: no slot, cap or order path is shared with it beyond the account cap. - 9 to 13 resolved trades over 7 sessions is a small sample, and the paper executor was down 10-26..11-05, so real fills cover only 10-21..10-23; if this was bad luck, the rules lose their forward test. - Their code and config rows stay, as with earlier retirements, and an open trade still resolves.
+
+### Requirements
+
+| ID | Requirement |
+| --- | --- |
+| MON-027-R1 | WHEN fade-priorpoc-2r, fade-priorpoc-va60-1r or fade-priorpoc-va80-1.5r would arm THEN it SHALL not, because strategy::is_active is false for them |
+
+### Scenarios
+
+| ID | Requirement | Layer | Scenario |
+| --- | --- | --- | --- |
+| the_prior_poc_fades_are_not_active | MON-027-R1 | unit | Given the deprecated slugs, including the three prior-POC fades (2026-11-05), when strategy::is_active runs for each, then false. |
+

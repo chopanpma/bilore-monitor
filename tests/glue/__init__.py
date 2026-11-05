@@ -548,6 +548,10 @@ def fade_poc_globex_is_not_active():
     _delegate('strategy::tests::deprecated_strategies_are_not_active', target=('-p', 'bilore-core', '--lib'))
 
 
+def the_prior_poc_fades_are_not_active():
+    _delegate('strategy::tests::deprecated_strategies_are_not_active', target=('-p', 'bilore-core', '--lib'))
+
+
 def the_alert_becomes_an_entered_trade_toward_the_poc():
     _delegate('va_alert::tests::the_alert_becomes_an_entered_trade_toward_the_poc')
 

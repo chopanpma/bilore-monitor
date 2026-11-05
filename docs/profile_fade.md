@@ -1,5 +1,7 @@
 # profile_fade
 
+**2026-11-05 (MON-027): fade-priorpoc-va60-1r and fade-priorpoc-va80-1.5r retired on the shadow record; the code stays, and `strategy::is_active` keeps it from arming.**
+
 Source: `src/profile_fade.rs` (pure) · wired in `main.rs` (`PfSlot`, `PfPrior`,
 `fetch_pf_prior`, `try_pf_signal`, the per-tick MON-017 block) · New 2026-10-18 (MON-017).
 Seven configured strategies, one slot each; only those in `strategy::ACTIVE` arm (2026-10-18: the five devpoc/todaylvl rules are retired, MON-019/MON-020; the two prior-POC picks are active), registered in `bilore-project-conf/contracts/strategies.md`.
