@@ -59,7 +59,8 @@ use bilore_core::volatility::{Baseline, Release, CALENDAR_UNAVAILABLE};
 use bilore_monitor::feed_watch::{FeedNotice, FeedWatch};
 use bilore_monitor::va_alert;
 use bilore_monitor::vol_gate::{Notice, VolGate};
-use bilore_monitor::{daily_summary, db, exec, globex, levels, priorpoc, profile_fade, sound, telegram, wide};
+use bilore_monitor::{daily_summary, db, exec, globex, half_back, levels, priorpoc, profile_fade, sound, telegram, wide};
+use bilore_ml_rs::half_back::RefRange;
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use chrono_tz::America::Chicago;
 use ndarray::Array1;
@@ -400,6 +401,8 @@ struct PerSymbolState {
     va_fade: StrategySlot,
     va_fade_session: Option<va_alert::SessionId>,
     va_fade_mark: Option<Decimal>,
+    /// MON-028 half-back-rth (RTH, last 4 periods' half-back).
+    hb: HbSlot,
 }
 
 /// Everything MON-011 tracks for the current RTH or Globex session: the
@@ -467,6 +470,19 @@ struct RollSlot {
     cfg: RollConfig,
     slot: StrategySlot,
     key: Option<NaiveDate>,
+}
+
+/// MON-028 half-back-rth: its slot, the RTH day in progress, the reference
+/// its open trade was armed on, today's used (reference, direction) pairs,
+/// the reference last evaluated and the last RTH price (the 15:00 mark).
+#[derive(Default)]
+struct HbSlot {
+    slot: StrategySlot,
+    day: Option<NaiveDate>,
+    key: Option<i64>,
+    used: Vec<(i64, Direction)>,
+    seen: Option<i64>,
+    mark: Option<Decimal>,
 }
 
 /// Trains fresh from whatever `period_profiles`/`session_profiles`/
@@ -717,6 +733,36 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
         }
         roll.push(RollSlot { cfg, slot, key });
     }
+    // MON-028 half-back-rth: keep today's RTH open trade (with the reference
+    // it was armed on), expire anything older; rebuild today's used pairs.
+    let hb_day = half_back::in_window(now_local.time()).then(|| now_local.date());
+    let mut hb = HbSlot { day: hb_day, ..HbSlot::default() };
+    for row in db::fetch_open_trades_for_strategy(pool, symbol, strategy::HALF_BACK_RTH).await? {
+        let Some(mut ot) = restore_open_trade(&row) else { continue };
+        if Some(row.session_date) == hb_day && hb.slot.open.is_none() {
+            hb.key = Some(half_back::key_at(ot.since.with_timezone(&Chicago).naive_local()));
+            tracing::info!("{symbol}: restored open [{}] trade #{} ({:?})", strategy::HALF_BACK_RTH, ot.db_id, ot.trade.outcome);
+            hb.slot.open = Some(ot);
+        } else if shadow_trader::close(&mut ot.trade) {
+            tracing::warn!("{symbol}: expiring stale open [{}] trade #{} from {}", strategy::HALF_BACK_RTH, ot.db_id, row.session_date);
+            db::update_shadow_trade_v2(pool, ot.db_id, &ot.trade).await?;
+        }
+    }
+    if let Some(day) = hb_day {
+        let signals: Vec<(Direction, chrono::NaiveDateTime)> = db::fetch_signals(pool, day, symbol, strategy::HALF_BACK_RTH)
+            .await?
+            .into_iter()
+            .filter_map(|(dir, at)| {
+                let d = match dir.as_str() {
+                    "Long" => Direction::Long,
+                    "Short" => Direction::Short,
+                    _ => return None,
+                };
+                Some((d, at.with_timezone(&Chicago).naive_local()))
+            })
+            .collect();
+        hb.used = half_back::used_from_signals(&signals);
+    }
     // MON-025 fade-va-alert: keep the newest open trade with the session it
     // was opened in; the first live tick after that session closes it.
     let mut va_fade = StrategySlot::default();
@@ -771,6 +817,7 @@ async fn init_symbol_state(pool: &PgPool, symbol: &str, bridge_from: Option<&str
         va_fade,
         va_fade_session,
         va_fade_mark: None,
+        hb,
         wide,
         priorpoc,
         priorpoc_prior: fetch_prior_rth_pct(pool, symbol, today_ct, priorpoc::VA_PCT).await?,
@@ -1323,6 +1370,52 @@ async fn main() -> Result<()> {
                             try_roll_signal(&pool, symbol, &setup_cfg, tick.price, date, &snap, r).await;
                         }
                     }
+
+                    // half-back-rth (MON-028): the 15:00 close, then cancel a
+                    // pending setup whose reference changed or whose fill zone
+                    // price jumped past, then arm — before the advance below.
+                    let day = half_back::in_window(tick_ct.time()).then(|| tick_ct.date());
+                    if day != state.hb.day {
+                        if let Some(mut ot) = state.hb.slot.open.take() {
+                            let mark = state.hb.mark.unwrap_or(tick.price);
+                            // like the backtest, a setup that never filled leaves no result
+                            let changed = half_back::cancel(&mut ot.trade)
+                                || shadow_trader::close_at_mark(&mut ot.trade, mark, tick_size, tick_value);
+                            if changed {
+                                let _ = db::update_shadow_trade_v2(&pool, ot.db_id, &ot.trade).await;
+                                tracing::info!("{symbol}: [{}] #{} closed at the RTH end ({mark}, {:?})", strategy::HALF_BACK_RTH, ot.db_id, ot.trade.outcome);
+                            }
+                        }
+                        state.hb = HbSlot { day, ..HbSlot::default() };
+                    }
+                    if let Some(date) = state.hb.day {
+                        state.hb.mark = Some(tick.price);
+                        let reference = half_back::reference(&state.rolling);
+                        let reference_key = reference.map(|r| r.key);
+                        let stale = state.hb.slot.open.as_ref().is_some_and(|ot| {
+                            ot.sees(tick.ts) && half_back::cancels(&ot.trade, state.hb.key, reference_key, tick.price)
+                        });
+                        if stale {
+                            if let Some(mut ot) = state.hb.slot.open.take() {
+                                half_back::cancel(&mut ot.trade);
+                                report_invalidated(&pool, symbol, strategy::HALF_BACK_RTH, &ot, "its reference changed or price jumped past the fill zone").await;
+                            }
+                        }
+                        if state.hb.seen != reference_key {
+                            state.hb.seen = reference_key;
+                            state.hb.slot.last_checked_price = None; // a new reference re-checks the price
+                        }
+                        if let Some(r) = reference {
+                            if strategy::is_active(strategy::HALF_BACK_RTH)
+                                && state.hb.slot.open.is_none()
+                                && state.hb.slot.last_checked_price != Some(tick.price)
+                                && gate_allows(&mut state.hb.slot, &state.vol, tick_ct, symbol, strategy::HALF_BACK_RTH)
+                            {
+                                state.hb.slot.last_checked_price = Some(tick.price);
+                                try_half_back_signal(&pool, symbol, tick.price, date, &r, &mut state.hb).await;
+                            }
+                        }
+                    }
                 }
 
                 // fade-priorpoc-2r (MON-016): flip invalidation against its own
@@ -1415,7 +1508,8 @@ async fn main() -> Result<()> {
                 ];
                 let roll_slots = state.roll.iter_mut().map(|r| (&mut r.slot, r.cfg.slug));
                 let pf_slots = state.pf.iter_mut().map(|p| (&mut p.slot, p.cfg.slug));
-                for (slot, slug) in fixed_slots.into_iter().chain(roll_slots).chain(pf_slots) {
+                let hb_slot = std::iter::once((&mut state.hb.slot, strategy::HALF_BACK_RTH));
+                for (slot, slug) in fixed_slots.into_iter().chain(roll_slots).chain(pf_slots).chain(hb_slot) {
                     // Fills and exits never consult the volatility gate
                     // (SYS-006: blocks stop new setups only).
                     if advance_open_trade(slot, tick.ts, tick.price, state.tick_size, state.tick_value).is_some() {
@@ -2026,6 +2120,41 @@ async fn try_roll_signal(
     );
     // MON-012: setups are logged, not sent to Telegram.
     tracing::info!("{}", msg.replace("<b>", "").replace("</b>", ""));
+}
+
+/// Arm a half-back-rth setup (MON-028) at `price` on reference `r`: a
+/// Pending stop-type trade stored under today's date. Shadow only — never
+/// published to the order executor (its limit entries would fill a
+/// stop-type entry at once).
+async fn try_half_back_signal(pool: &PgPool, symbol: &str, price: Decimal, date: NaiveDate, r: &RefRange, hb: &mut HbSlot) {
+    let (trade, plan) = match half_back::setup(price, r, &hb.used) {
+        Ok(x) => x,
+        Err(reason) => {
+            if hb.slot.last_logged_reason.as_deref() != Some(reason.as_str()) {
+                tracing::debug!("{symbol}: no {} setup: {reason}", strategy::HALF_BACK_RTH);
+                hb.slot.last_logged_reason = Some(reason);
+            }
+            return;
+        }
+    };
+    match db::insert_shadow_trade_v2(pool, date, symbol, strategy::HALF_BACK_RTH, None, &trade).await {
+        Ok(id) => {
+            hb.used.push((r.key, trade.direction));
+            hb.key = Some(r.key);
+            hb.slot.open = Some(OpenTrade { db_id: id, trade, trust: 0.0, since: Utc::now() });
+        }
+        Err(e) => {
+            tracing::error!("{symbol}: insert_shadow_trade_v2 ({}) failed, setup not tracked: {e}", strategy::HALF_BACK_RTH);
+            return;
+        }
+    }
+    // MON-012: setups are logged, not sent to Telegram.
+    tracing::info!(
+        "{symbol} LOCKED [{}]: {:?} entry={} stop={} target={} (half-back {} of the last {} periods {}-{})",
+        strategy::HALF_BACK_RTH, plan.direction, plan.entry, plan.stop, plan.target,
+        bilore_ml_rs::half_back::half_back(r), half_back::PERIODS, r.low, r.high
+    );
+    sound::play(sound::AlertKind::Setup);
 }
 
 /// Persist + alert a pending setup cancelled by

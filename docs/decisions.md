@@ -717,3 +717,32 @@ sequenceDiagram
 | --- | --- | --- | --- |
 | the_prior_poc_fades_are_not_active | MON-027-R1 | unit | Given the deprecated slugs, including the three prior-POC fades (2026-11-05), when strategy::is_active runs for each, then false. |
 
+## MON-028 — half-back-rth: the Market Profile half-back on the last 4 completed 30-min periods as an RTH shadow trade — stop-type entry one tick past the midpoint, target one tick before the far extreme, stop one tick past the near extreme
+
+**Status:** accepted
+
+**Context:** User decision 2026-11-07 ('go ahead'), after the 2026-11-06 half-back backtest (bilore-ml-rs ML-011, findings 2026-11-06-half-back). Exact rule: reference = the high-low range of the last 4 completed 30-min periods (rolling::RollingLevels, the same periods the fade-roll strategies use), only when it is 64+ ticks; price above its half-back arms a short one tick below it, price below arms a long one tick above it (bilore_ml_rs::half_back::arm_direction / plan / fill_zone, the code the backtest runs); filled at the traded price up to 2 ticks past the trigger, a jump further is a miss; target one tick before the far extreme, stop one tick past the near extreme, skipped if the stop is more than 80 ticks away; 1 MES, one open trade at a time, each (reference, direction) once; a new reference cancels a pending setup (recorded as invalidated), an entered trade keeps its stop and target; RTH 08:30-15:00 CT only, closed at the last RTH price. Evidence: IBKR 1-min bars 2025-10-01 -> 2026-10-01, 451t, 56.2% win, +2.9 ticks/trade, +$1,662, max DD -$819, H1 +$759 / H2 +$904 (below the 5-tick go-live gate); out of sample (recorded ticks 2026-09-30 -> 11-06 as 1-s bars) 67t, +7.9 ticks/trade, +$659. Picked from 216 searched rows: a forward test. Review after ~40 resolved trades: retire if negative or under +2 ticks/trade.
+
+**Consequences:** + an RTH breakout-through-the-midpoint rule next to the fades, measured trade by trade in the daily summary and the go-live gate. - shadow only: the writer never publishes to the order executor, which places limit entries and would fill a stop-type entry at once; paper needs a stop-limit entry first. - deviations from the backtest: the volatility block (SYS-006) stops new setups; after a restart the used (reference, direction) pairs are rebuilt from today's rows by their arm time; the stored stop_ticks of a short is 2 ticks wide (measured from the zone's far end).
+
+### Requirements
+
+| ID | Requirement |
+| --- | --- |
+| MON-028-R1 | WHEN 4 completed 30-min periods exist THEN the half-back reference SHALL be their combined high and low, keyed by the latest period's start, and there SHALL be none before that |
+| MON-028-R2 | WHEN half-back-rth is free in RTH and the reference is 64+ ticks THEN a pending stop-type trade SHALL be armed toward the far extreme with the ML-011 entry zone, stop and target, unless that (reference, direction) was already used today |
+| MON-028-R3 | WHEN a pending half-back trade's reference changes or price jumps past its fill zone THEN it SHALL be cancelled as invalidated, an entered trade SHALL keep running, and after a restart the used pairs SHALL be rebuilt from today's arm times |
+
+### Scenarios
+
+| ID | Requirement | Layer | Scenario |
+| --- | --- | --- | --- |
+| the_range_of_the_last_n_periods_carries_the_latest_start | MON-028-R1 | unit | Given ticks in the 09:00, 09:30 and 10:00 periods, when RollingLevels::range(2) is asked at 10:05, then the high and low of 09:00-10:00 keyed by 09:30; range(3) is None. |
+| the_reference_is_the_last_four_periods | MON-028-R1 | unit | Given four completed periods from 08:30 to 10:30 with a high of 7720 and a low of 7700, when half_back::reference runs at 10:35, and after only three periods, then RefRange 7700-7720 keyed by the 10:00 period; None with three. |
+| a_setup_is_a_stop_entry_toward_the_far_extreme | MON-028-R2 | unit | Given reference 7700-7720 (80 ticks), when price 7715 and price 7705 arm, then Pending Short, zone 7709.25-7709.75, stop 7720.25, target 7700.25; Pending Long, zone 7710.25-7710.75, stop 7699.75, target 7719.75. |
+| a_narrow_reference_or_a_used_direction_arms_nothing | MON-028-R2 | unit | Given a 60-tick reference; an 80-tick one whose short was used, when price above the half-back arms, then no setup for either. |
+| only_rth_opens_setups | MON-028-R2 | unit | Given 08:29, 08:30, 14:59, 15:00, when in_window runs, then false, true, true, false. |
+| the_config_pins_the_evidence | MON-028-R2 | unit | Given half_back::params and PERIODS, when read, then 4 periods, 64-tick minimum, full stop, 80-tick maximum, 0.25 tick. |
+| a_new_reference_or_a_jump_cancels_a_pending_setup | MON-028-R3 | unit | Given a pending short keyed by reference A, zone 7709.25-7709.75; and the same trade entered, when reference B appears, or price trades 7709.00 under A, then cancels is true for the pending one in both cases and cancel marks it invalidated; false for the entered one. |
+| a_restart_restores_the_used_directions | MON-028-R3 | unit | Given today's rows: a short armed at 09:47 CT and a long at 10:02 CT, when used_from_signals runs, then (09:00 key, Short) and (09:30 key, Long) — each keyed by the period completed before its arm time. |
+

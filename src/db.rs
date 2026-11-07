@@ -401,6 +401,20 @@ pub async fn fetch_open_trades_for_strategy(pool: &PgPool, symbol: &str, strateg
     .await?)
 }
 
+/// Direction and arm time of every `strategy` row dated `date` (MON-028
+/// restart restore of the used half-back references).
+pub async fn fetch_signals(pool: &PgPool, date: NaiveDate, symbol: &str, strategy: &str) -> Result<Vec<(String, DateTime<Utc>)>> {
+    Ok(sqlx::query_as(
+        "SELECT direction, signal_at FROM shadow_trades_v2 \
+         WHERE session_date = $1 AND symbol = $2 AND strategy = $3 ORDER BY signal_at",
+    )
+    .bind(date)
+    .bind(symbol)
+    .bind(strategy)
+    .fetch_all(pool)
+    .await?)
+}
+
 /// 30-second ranges of `symbol` between `from` and `to`, one per 5-second
 /// bucket (max-min over that bucket and the 5 before it), as Chicago wall
 /// clock — the baseline samples for the volatility gate (bilore-specs

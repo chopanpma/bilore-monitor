@@ -583,3 +583,35 @@ def a_consistent_gap_or_too_many_disagreements_is_a_divergence():
 
 def the_section_shows_today_the_total_and_the_verdict():
     _delegate('exec_compare::tests::the_section_shows_today_the_total_and_the_verdict')
+
+
+def the_range_of_the_last_n_periods_carries_the_latest_start():
+    _delegate('rolling::tests::the_range_of_the_last_n_periods_carries_the_latest_start')
+
+
+def the_reference_is_the_last_four_periods():
+    _delegate('half_back::tests::the_reference_is_the_last_four_periods')
+
+
+def a_setup_is_a_stop_entry_toward_the_far_extreme():
+    _delegate('half_back::tests::a_setup_is_a_stop_entry_toward_the_far_extreme')
+
+
+def a_narrow_reference_or_a_used_direction_arms_nothing():
+    _delegate('half_back::tests::a_narrow_reference_or_a_used_direction_arms_nothing')
+
+
+def only_rth_opens_setups():
+    _delegate('half_back::tests::only_rth_opens_setups')
+
+
+def the_config_pins_the_evidence():
+    _delegate('half_back::tests::the_config_pins_the_evidence')
+
+
+def a_new_reference_or_a_jump_cancels_a_pending_setup():
+    _delegate('half_back::tests::a_new_reference_or_a_jump_cancels_a_pending_setup')
+
+
+def a_restart_restores_the_used_directions():
+    _delegate('half_back::tests::a_restart_restores_the_used_directions')

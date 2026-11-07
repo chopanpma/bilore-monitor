@@ -8,6 +8,8 @@ per-tick `fade-roll-*` block) · New 2026-10-02. Strategies `fade-roll-evening`,
 The user's own style (their 09-28..10-02 ES fills: fades at the overnight
 extremes and value edges, ~6-point targets, tight risk) with ROLLING levels
 from the last 16 completed 30-min periods, one strategy per trading window.
+`RollingLevels::range(n)` (2026-11-07) gives the last n periods' high/low keyed by the
+latest period's start, for `half-back-rth` (MON-028, [half_back.md](half_back.md)).
 
 ```mermaid
 flowchart TD

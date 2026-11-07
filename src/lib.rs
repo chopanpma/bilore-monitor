@@ -5,6 +5,7 @@ pub mod exec;
 pub mod exec_compare;
 pub mod feed_watch;
 pub mod globex;
+pub mod half_back;
 pub mod levels;
 pub mod live_signal;
 pub mod period_agg;

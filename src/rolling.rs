@@ -88,6 +88,7 @@ pub struct Snapshot {
 }
 
 struct Period {
+    start: NaiveDateTime,
     vp: VolumeProfile,
     high: Decimal,
     low: Decimal,
@@ -120,10 +121,21 @@ impl RollingLevels {
                 }
             }
         }
-        let (_, p) = self.current.get_or_insert_with(|| (start, Period { vp: VolumeProfile::default(), high: price, low: price }));
+        let (_, p) = self.current.get_or_insert_with(|| (start, Period { start, vp: VolumeProfile::default(), high: price, low: price }));
         p.vp.add(price, size);
         p.high = p.high.max(price);
         p.low = p.low.min(price);
+    }
+
+    /// (latest period's start, high, low) of the last `n` completed periods;
+    /// `None` until there are `n` (MON-028's half-back reference).
+    pub fn range(&self, n: usize) -> Option<(NaiveDateTime, Decimal, Decimal)> {
+        if n == 0 || self.done.len() < n {
+            return None;
+        }
+        let window = self.done.iter().rev().take(n);
+        let (high, low) = window.fold((Decimal::MIN, Decimal::MAX), |(h, l), p| (h.max(p.high), l.min(p.low)));
+        Some((self.done.back()?.start, high, low))
     }
 
     /// Levels of the last `n` completed periods; `None` until there are `n`.
@@ -258,6 +270,18 @@ mod tests {
         assert!(r.snapshot(1).is_some());
         feed(&mut r, "2026-10-04", 17, 0, "105.00", 1); // Sunday reopen
         assert_eq!(r.snapshot(1), None, "weekend gap starts a fresh window");
+    }
+
+    #[test]
+    fn the_range_of_the_last_n_periods_carries_the_latest_start() {
+        let mut r = RollingLevels::default();
+        feed(&mut r, "2026-11-09", 9, 5, "100.00", 1);
+        feed(&mut r, "2026-11-09", 9, 20, "98.00", 1);
+        feed(&mut r, "2026-11-09", 9, 40, "103.00", 1);
+        feed(&mut r, "2026-11-09", 10, 5, "101.00", 1); // completes 09:30
+        assert_eq!(r.range(2), Some((at("2026-11-09", 9, 30), d("103.00"), d("98.00"))));
+        assert_eq!(r.range(1), Some((at("2026-11-09", 9, 30), d("103.00"), d("103.00"))));
+        assert_eq!(r.range(3), None);
     }
 
     fn snap() -> Snapshot {
