@@ -1876,8 +1876,17 @@ async fn maybe_execute(pool: &PgPool, symbol: &str, slug: &str, trade_id: i64, t
             return;
         }
     };
+    // SYS-016: the mode's open orders, for its max-open cap.
+    let open_orders = match db::open_orders(pool, mode_name).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("{symbol}: [{slug}] #{trade_id} not executed — open orders unreadable: {e}");
+            return;
+        }
+    };
     let mut book = exec::book_from(&saved);
     let checks = exec::checks(&settings, slug, symbol, &realized, &mut book, today, gate_passed, false, kill);
+    let checks = bilore_core::execution::Checks { open_orders, ..checks };
     if let Some(capped_on) = exec::newly_capped(&saved, &book, slug) {
         if let Err(e) = db::save_cap(pool, slug, capped_on).await {
             tracing::error!("{symbol}: [{slug}] cap not saved: {e}");

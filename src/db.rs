@@ -346,6 +346,18 @@ pub async fn realized_today(pool: &PgPool, mode: &str, day: NaiveDate) -> Result
     .await?)
 }
 
+/// SYS-016: orders of `mode` open right now (every strategy, any day): the
+/// statuses live_orders' own open index covers.
+pub async fn open_orders(pool: &PgPool, mode: &str) -> Result<usize> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM live_orders WHERE mode = $1 AND status IN ('placing', 'working', 'filled')",
+    )
+    .bind(mode)
+    .fetch_one(pool)
+    .await?;
+    Ok(n as usize)
+}
+
 /// SYS-001-R2: strategies stopped by their cap and not re-enabled since.
 pub async fn saved_caps(pool: &PgPool) -> Result<Vec<(String, NaiveDate)>> {
     Ok(sqlx::query_as("SELECT strategy, capped_on FROM strategy_caps WHERE re_enabled_at IS NULL")

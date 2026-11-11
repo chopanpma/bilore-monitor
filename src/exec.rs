@@ -51,7 +51,23 @@ pub fn read_config(toml_text: &str) -> Result<ExecSettings, String> {
     // v2's own live switch; v1's [platform.ib_tws] autotrade_enabled drives v1 only.
     let autotrade_enabled = e.and_then(|e| e.get("autotrade")).and_then(|a| a.as_bool()).unwrap_or(false);
     let account_cap = e.and_then(|e| e.get("account_daily_loss_cap_usd")).and_then(num);
-    let exec = ExecConfig { paper: list("paper"), live: list("live"), account_cap };
+    // SYS-016: absent = no limit; anything but a whole number >= 1 is refused.
+    let max_open = |key: &str| -> Result<Option<usize>, String> {
+        match e.and_then(|e| e.get(key)) {
+            None => Ok(None),
+            Some(x) => match x.as_integer() {
+                Some(n) if n >= 1 => Ok(Some(n as usize)),
+                _ => Err(format!("[execution] {key} must be a whole number >= 1, got {x}")),
+            },
+        }
+    };
+    let exec = ExecConfig {
+        paper: list("paper"),
+        live: list("live"),
+        account_cap,
+        max_open_live: max_open("max_open_live")?,
+        max_open_paper: max_open("max_open_paper")?,
+    };
     exec.validate()?;
     Ok(ExecSettings { exec, autotrade_enabled, caps })
 }
@@ -81,6 +97,8 @@ pub fn checks(
         account_realized_today: account,
         volatility_block,
         kill_switch,
+        // SYS-016: counted from live_orders by the caller.
+        open_orders: 0,
     }
 }
 
@@ -134,6 +152,15 @@ account_daily_loss_cap_usd = 100
         assert_eq!(s.caps.cap_for("MESZ6"), Some(d("100")));
         let on = read_config(&RULES.replace("autotrade = false", "autotrade = true")).unwrap();
         assert!(on.autotrade_enabled);
+    }
+
+    #[test]
+    fn the_open_order_cap_is_read_per_mode() {
+        let s = read_config(&RULES.replace("account_daily_loss_cap_usd = 100", "account_daily_loss_cap_usd = 100\nmax_open_live = 1")).unwrap();
+        assert_eq!((s.exec.max_open_live, s.exec.max_open_paper), (Some(1), None));
+        assert_eq!(read_config(RULES).unwrap().exec.max_open_live, None, "absent = no limit");
+        let bad = RULES.replace("account_daily_loss_cap_usd = 100", "account_daily_loss_cap_usd = 100\nmax_open_paper = 0");
+        assert!(read_config(&bad).unwrap_err().contains("max_open_paper"));
     }
 
     #[test]
