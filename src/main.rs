@@ -1892,7 +1892,7 @@ async fn maybe_execute(pool: &PgPool, symbol: &str, slug: &str, trade_id: i64, t
             tracing::error!("{symbol}: [{slug}] cap not saved: {e}");
         }
         let (token, chat) = (std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(), std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default());
-        let text = format!("🛑 <b>[V2][{slug}] STOPPED — daily loss cap</b> ({mode_name})\nStays shadow-only, also on later days, until: <code>bilore enable {slug}</code>");
+        let text = format!("🛑 <b>[V2][{slug}] STOPPED — daily loss cap</b> ({mode_name})\nShadow-only for the rest of today; back by itself on the next trading day (or now: <code>bilore enable {slug}</code>)");
         notify(&reqwest::Client::new(), &token, &chat, &text).await;
     }
     let mode = match may_execute(&settings.exec, slug, &checks) {

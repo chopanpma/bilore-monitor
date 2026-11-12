@@ -358,20 +358,29 @@ pub async fn open_orders(pool: &PgPool, mode: &str) -> Result<usize> {
     Ok(n as usize)
 }
 
-/// SYS-001-R2: strategies stopped by their cap and not re-enabled since.
-pub async fn saved_caps(pool: &PgPool) -> Result<Vec<(String, NaiveDate)>> {
-    Ok(sqlx::query_as("SELECT strategy, capped_on FROM strategy_caps WHERE re_enabled_at IS NULL")
+/// SYS-001-R2: caps and manual disables not re-enabled since (a cap from an
+/// earlier day no longer refuses: `LossCapBook` clears it).
+pub async fn saved_caps(pool: &PgPool) -> Result<Vec<crate::exec::SavedCap>> {
+    Ok(sqlx::query_as("SELECT strategy, capped_on, manual FROM strategy_caps WHERE re_enabled_at IS NULL")
         .fetch_all(pool)
         .await?)
 }
 
-/// SYS-001-R2: save a cap; `bilore enable <strategy>` clears it.
+/// SYS-001-R2: save today's cap. An earlier day's cap row still open is closed
+/// first (cleared overnight, amended 2026-11-12); a manual disable is kept.
 pub async fn save_cap(pool: &PgPool, strategy: &str, capped_on: NaiveDate) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE strategy_caps SET re_enabled_at = now() WHERE strategy = $1 AND re_enabled_at IS NULL AND NOT manual AND capped_on < $2")
+        .bind(strategy)
+        .bind(capped_on)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("INSERT INTO strategy_caps (strategy, capped_on) VALUES ($1, $2) ON CONFLICT (strategy) WHERE re_enabled_at IS NULL DO NOTHING")
         .bind(strategy)
         .bind(capped_on)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }
 

@@ -102,19 +102,32 @@ pub fn checks(
     }
 }
 
+/// An open strategy_caps row: a daily cap (holds on `capped_on` only) or a
+/// manual disable (`bilore disable`, holds until `bilore enable`).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct SavedCap {
+    pub strategy: String,
+    pub capped_on: NaiveDate,
+    pub manual: bool,
+}
+
 /// SYS-001-R2: the cap book from the caps saved in strategy_caps, so a cap
-/// survives a restart and `bilore enable` applies without one.
-pub fn book_from(saved: &[(String, NaiveDate)]) -> LossCapBook {
+/// survives a restart and `bilore enable` / `disable` apply without one.
+pub fn book_from(saved: &[SavedCap]) -> LossCapBook {
     let mut book = LossCapBook::default();
-    for (slug, capped_on) in saved {
-        book.restore(slug, *capped_on);
+    for c in saved {
+        if c.manual {
+            book.disable(&c.strategy, c.capped_on);
+        } else {
+            book.restore(&c.strategy, c.capped_on);
+        }
     }
     book
 }
 
-/// The day `slug` was capped, if `checks` just capped it (not yet in `saved`).
-pub fn newly_capped(saved: &[(String, NaiveDate)], book: &LossCapBook, slug: &str) -> Option<NaiveDate> {
-    book.capped_on(slug).filter(|_| !saved.iter().any(|(s, _)| s == slug))
+/// The day `slug` was capped, if `checks` just capped it (not yet saved for that day).
+pub fn newly_capped(saved: &[SavedCap], book: &LossCapBook, slug: &str) -> Option<NaiveDate> {
+    book.capped_on(slug).filter(|day| !saved.iter().any(|c| c.strategy == slug && !c.manual && c.capped_on == *day))
 }
 
 #[cfg(test)]
@@ -196,9 +209,15 @@ account_daily_loss_cap_usd = 100
     fn a_saved_cap_survives_a_restart() {
         let s = read_config(RULES).unwrap();
         let (capped_on, tomorrow) = (NaiveDate::from_ymd_opt(2026, 11, 5).unwrap(), NaiveDate::from_ymd_opt(2026, 11, 6).unwrap());
-        let mut book = book_from(&[("fade-priorpoc-va60-1r".to_string(), capped_on)]);
-        let c = checks(&s, "fade-priorpoc-va60-1r", "MESZ6", &[], &mut book, tomorrow, false, false, false);
-        assert_eq!(c.strategy_cap, Entry::Refused(Refusal::AwaitingReEnable { capped_on }));
+        let slug = "fade-priorpoc-va60-1r";
+        let saved = [SavedCap { strategy: slug.into(), capped_on, manual: false }];
+        let c = checks(&s, slug, "MESZ6", &[], &mut book_from(&saved), capped_on, false, false, false);
+        assert_eq!(c.strategy_cap, Entry::Refused(Refusal::AwaitingReEnable { capped_on }), "the same day");
+        let c = checks(&s, slug, "MESZ6", &[], &mut book_from(&saved), tomorrow, false, false, false);
+        assert_eq!(c.strategy_cap, Entry::Allowed, "cleared overnight");
+        let parked = [SavedCap { strategy: slug.into(), capped_on, manual: true }];
+        let c = checks(&s, slug, "MESZ6", &[], &mut book_from(&parked), tomorrow, false, false, false);
+        assert_eq!(c.strategy_cap, Entry::Refused(Refusal::Disabled { since: capped_on }), "bilore disable holds");
     }
 
     #[test]
@@ -212,10 +231,15 @@ account_daily_loss_cap_usd = 100
         checks(&s, slug, "MESZ6", &realized, &mut fresh, today, false, false, false);
         assert_eq!(newly_capped(&[], &fresh, slug), Some(today), "reached the cap just now");
 
-        let saved = vec![(slug.to_string(), today)];
+        let saved = vec![SavedCap { strategy: slug.into(), capped_on: today, manual: false }];
         let mut restored = book_from(&saved);
         checks(&s, slug, "MESZ6", &realized, &mut restored, today, false, false, false);
         assert_eq!(newly_capped(&saved, &restored, slug), None, "already saved");
+
+        let yesterday = vec![SavedCap { strategy: slug.into(), capped_on: today.pred_opt().unwrap(), manual: false }];
+        let mut again = book_from(&yesterday);
+        checks(&s, slug, "MESZ6", &realized, &mut again, today, false, false, false);
+        assert_eq!(newly_capped(&yesterday, &again, slug), Some(today), "yesterday's row doesn't hide today's cap");
 
         let mut under = book_from(&[]);
         checks(&s, slug, "MESZ6", &[], &mut under, today, false, false, false);
